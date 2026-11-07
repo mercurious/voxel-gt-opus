@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>VOXEL GT</title>
+  <meta name="description" content="A voxel touring-car racing game: five road cars, three real circuits." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">{ "imports": { "three": "./node_modules/three/build/three.module.js" } }</script>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+
+  <div id="hud" class="hidden">
+    <div class="hud-tl">
+      <div class="pos-box" id="hPosBox"><label>POS</label><span id="hPos">5</span><small>/<span id="hPosT">5</span></small></div>
+      <div class="lap-box"><label>LAP</label><span id="hLap">1/3</span></div>
+    </div>
+    <ol class="standings" id="hStand"></ol>
+    <div class="hud-tr">
+      <div class="t-main"><label>TIME</label><span id="hTime">0:00.000</span></div>
+      <div class="t-sub"><label id="hBestLabel">BEST</label><span id="hBest">--:--.---</span></div>
+      <div class="t-sub"><label>LAST</label><span id="hLast">--:--.---</span></div>
+    </div>
+    <canvas id="minimap" width="220" height="220"></canvas>
+    <div class="hud-br">
+      <canvas id="tach" width="300" height="300"></canvas>
+      <div class="gear" id="hGear">N</div>
+      <div class="speed"><span id="hSpeed">0</span><small id="hUnit">km/h</small></div>
+      <div class="boost hidden" id="hBoost"><label>BOOST</label><i><b id="hBoostBar"></b></i></div>
+      <div class="aids"><span id="hTcs">TCS</span><span id="hAsm">ASM</span><span class="cam" id="hCam">Chase</span></div>
+    </div>
+    <div id="hCenter"></div>
+    <div id="hWarn" class="hidden">WRONG WAY</div>
+    <div id="touch">
+      <button data-touch="left" aria-label="Steer left">◀</button>
+      <button data-touch="right" aria-label="Steer right">▶</button>
+      <button data-touch="brake" aria-label="Brake">BRAKE</button>
+      <button data-touch="gas" aria-label="Accelerate">GAS</button>
+    </div>
+  </div>
+
+  <div id="menu" class="hidden"></div>
+
+  <div id="loading">
+    <div class="lbox">
+      <div class="logo small"><span class="vox">VOXEL</span><span class="gt">GT</span></div>
+      <div class="lt"></div>
+      <div class="ls"></div>
+      <div class="lbar"><i></i></div>
+    </div>
+  </div>
+
+  <div id="fatal" class="hidden">
+    <div class="lbox"><b>WebGL unavailable.</b><br />VOXEL GT needs a browser with WebGL enabled.</div>
+  </div>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
