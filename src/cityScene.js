@@ -7,7 +7,7 @@
 // for landmarks. Same interface as buildTrackScene().
 import * as THREE from 'three';
 import { BoxBuilder } from './voxel.js';
-import { hash2, rng, smoothstep } from './util.js';
+import { hash2, rng } from './util.js';
 import { escapeAt } from './trackCore.js';
 import {
   lambert, pick, SPONSORS, textTexture, buildSkyAndLights, addStartGrid, buildGantry,
@@ -17,6 +17,7 @@ import { decodeCity } from './city/cityData.js';
 import { makeFacadeMaterial, FacadeBuilder, addBuilding, styleFor, STYLE } from './city/buildings.js';
 import * as props from './city/props.js';
 import { CITY_MODULES } from './city/index.js';
+import { courseGround, groundMesh } from './city/ground.js';
 
 const CH = 200; // scenery chunk size (m), for frustum + shadow culling
 const SIDEWALK = 4.5;
@@ -54,46 +55,24 @@ export function buildCityScene(track, opts = {}) {
   if (th.moon) { env.sun.scale.setScalar(0.32); env.sun.material.color.set('#f2f0e4'); }
 
   // ---- course lookups ---------------------------------------------------------
-  const SC = 24;
-  const sgrid = new Map();
-  const skey = (a, b) => a * 73856093 ^ b * 19349663;
-  for (let i = 0; i < N; i++) {
-    const k = skey(Math.floor(px[i] / SC), Math.floor(pz[i] / SC));
-    if (!sgrid.has(k)) sgrid.set(k, []);
-    sgrid.get(k).push(i);
-  }
-  // nearest course sample within r metres, or -1
-  const nearest = (x, z, r) => {
-    let best = -1, bd = r * r;
-    const c0 = Math.floor((x - r) / SC), c1 = Math.floor((x + r) / SC), d0 = Math.floor((z - r) / SC), d1 = Math.floor((z + r) / SC);
-    for (let a = c0; a <= c1; a++) for (let b = d0; b <= d1; b++) {
-      const cell = sgrid.get(skey(a, b));
-      if (cell) for (const i of cell) { const d = (px[i] - x) ** 2 + (pz[i] - z) ** 2; if (d < bd) { bd = d; best = i; } }
-    }
-    return best;
-  };
+  // nearest(x, z, r): nearest course sample within r metres, or -1;
+  // groundY(x, z): ground / sidewalk level (city/ground.js)
+  const { nearest, groundY } = courseGround(track, city.demAt);
   const courseAt = (x, z) => {
     let i = nearest(x, z, 160);
     if (i < 0) i = track.locate(x, z).i;
     const d = (x - px[i]) * nx[i] + (z - pz[i]) * nz[i];
     return { i, d, dist: Math.hypot(x - px[i], z - pz[i]), wallL: track.wallL[i], wallR: track.wallR[i], hw: track.hw[i], heading: Math.atan2(tx[i], tz[i]) };
   };
-  // inside the barriers of the course (plus margin)?
-  const inCourse = (x, z, margin = 0) => {
+  // on the course's road (out to its barrier line) or an escape road, plus margin?
+  const onRoad = (x, z, margin = 0) => {
     const i = nearest(x, z, 40);
     if (i < 0) return false;
     const rx = x - px[i], rz = z - pz[i];
     const along = rx * tx[i] + rz * tz[i], d = rx * nx[i] + rz * nz[i];
-    return Math.abs(along) <= ds * 1.5 && d <= track.wallL[i] + margin && -d <= track.wallR[i] + margin;
+    return Math.abs(along) <= ds * 1.5 && d <= track.roadL[i] + margin && -d <= track.roadR[i] + margin;
   };
-  // ground / sidewalk level: real elevation, pulled onto the course height near it
-  const demAt = city.demAt;
-  const groundY = (x, z) => {
-    let y = demAt(x, z);
-    const i = nearest(x, z, 110);
-    if (i >= 0) y += (py[i] - demAt(px[i], pz[i])) * (1 - smoothstep(25, 110, Math.hypot(x - px[i], z - pz[i])));
-    return y;
-  };
+  const inCourse = (x, z, margin = 0) => onRoad(x, z, margin) || !!escapeAt(track, x, z, margin);
 
   // ---- scenery chunks ----------------------------------------------------------
   const chunks = new Map();
@@ -107,6 +86,7 @@ export function buildCityScene(track, opts = {}) {
   const boxes = (x, z, layer = 'props') => chunk(x, z)[layer];
 
   // street rectangles (for sidewalk gaps at cross streets)
+  const skey = (a, b) => a * 73856093 ^ b * 19349663;
   const streetSegs = [];
   const stGrid = new Map();
   for (const s of city.streets) {
@@ -152,25 +132,15 @@ export function buildCityScene(track, opts = {}) {
   const pave = th.ground || walk, plaza = th.plaza || pave;
   const paint = th.night ? '#cfcfc8' : '#e8e6df', centreLine = th.centreLine || paint;
 
-  // ---- ground: one draped grid (concrete), lowered under the course ---------------
+  // ---- ground: one draped grid (concrete), lowered under the course (city/ground.js) ----
   {
     const [bx0, bz0, bx1, bz1] = city.bounds;
-    const M = 1300, C = 40;
-    const x0 = bx0 - M, z0 = bz0 - M, nxg = Math.ceil((bx1 - bx0 + 2 * M) / C), nzg = Math.ceil((bz1 - bz0 + 2 * M) / C);
-    const pos = [], col = [], idx = [];
     const c = new THREE.Color();
-    for (let j = 0; j <= nzg; j++) for (let i = 0; i <= nxg; i++) {
-      const x = x0 + i * C, z = z0 + j * C;
-      const near = nearest(x, z, 30);
-      const inside = x > bx0 && x < bx1 && z > bz0 && z < bz1;
-      pos.push(x, groundY(x, z) - (near >= 0 ? 0.9 : 0.3), z);
-      c.set(pick(pave, hash2(i, j, 4))).multiplyScalar(inside ? 0.92 : 0.78);
-      col.push(c.r, c.g, c.b);
-    }
-    for (let j = 0; j < nzg; j++) for (let i = 0; i < nxg; i++) {
-      const a = j * (nxg + 1) + i, b = a + 1, d = a + nxg + 1, e = d + 1;
-      idx.push(a, d, b, b, d, e);
-    }
+    const shade = (i, j, x, z) => {
+      c.set(pick(pave, hash2(i, j, 4))).multiplyScalar(x > bx0 && x < bx1 && z > bz0 && z < bz1 ? 0.92 : 0.78);
+      return [c.r, c.g, c.b];
+    };
+    const { pos, col, idx } = groundMesh(city.bounds, { nearest, groundY }, shade);
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
@@ -334,7 +304,7 @@ export function buildCityScene(track, opts = {}) {
     group.add(m);
     roadB = new BoxBuilder();
   };
-  const inner = (i, side) => (side > 0 ? track.wallL[i] : track.wallR[i]) + 0.6; // behind the barrier
+  const inner = (i, side) => (side > 0 ? track.roadL[i] : track.roadR[i]) + 0.6; // behind the barrier
   const outer = (i, side) => Math.max(inner(i, side) + 2.2, track.hw[i] + SIDEWALK);
   const sideGap = new Uint8Array(N * 2); // 1 = cross street / escape at this sidewalk sample
   for (let i = 0; i < N; i++) for (const [k, side] of [[0, 1], [1, -1]]) {
@@ -372,6 +342,26 @@ export function buildCityScene(track, opts = {}) {
       const ex = q[1][0] - q[0][0], ez = q[1][2] - q[0][2];
       if (ex * fn[2] - ez * fn[0] > 0) roadB.quad(q[0], q[1], q[2], q[3], '#8f8b85', fn);
       else roadB.quad(q[1], q[0], q[3], q[2], '#8f8b85', fn);
+    }
+  }
+  flushRoad();
+  // escape roads: asphalt over the whole road, on the ground they lie at
+  // (city/ground.js), where the course road doesn't already cover it, and on
+  // under the side walls (the barrier line can run a little outside the
+  // escape's rectangle where it meets the course barrier)
+  for (const e of track.escapes) {
+    const W = e.hw + 0.6, nA = Math.ceil(e.len / 2), nL = Math.ceil(W), cA = e.len / nA, cL = (2 * W) / nL;
+    const at = (a, l) => { const x = e.x + e.dx * a + e.nx * l, z = e.z + e.dz * a + e.nz * l; return [x, groundY(x, z) + 0.03, z]; };
+    for (let a = 0; a < nA; a++) {
+      for (let l = 0; l < nL; l++) {
+        const a0 = a * cA, a1 = a0 + cA, l0 = -W + l * cL, l1 = l0 + cL;
+        const c = [at(a0, l0), at(a1, l0), at(a1, l1), at(a0, l1)];
+        if (c.every((p) => onRoad(p[0], p[2], -0.1))) continue;
+        const ux = c[1][0] - c[0][0], uz = c[1][2] - c[0][2], vx = c[3][0] - c[0][0], vz = c[3][2] - c[0][2];
+        const col = pick(asphalt, hash2(a >> 1, l, 13));
+        if (ux * vz - uz * vx < 0) roadB.quad(c[0], c[1], c[2], c[3], col, [0, 1, 0]);
+        else roadB.quad(c[0], c[3], c[2], c[1], col, [0, 1, 0]);
+      }
     }
   }
   flushRoad();
@@ -449,68 +439,69 @@ export function buildCityScene(track, opts = {}) {
     banUv.push(0, v0, 1, v0, 1, v1, 0, v1);
     banIdx.push(v, v + 1, v + 2, v, v + 2, v + 3);
   };
-  const BLOCK = 2; // samples per barrier block
-  const barrierAt = (x, z) => !escapeAt(track, x, z, -0.3);
-  let ucum = 0, bannerRun = 0;
-  for (const side of [1, -1]) {
-    for (let i = 0; i < N; i += BLOCK) {
-      const j = (i + BLOCK) % N;
-      const w0 = side > 0 ? track.wallL[i] : track.wallR[i], w1 = side > 0 ? track.wallL[j] : track.wallR[j];
-      const ax = px[i] + nx[i] * w0 * side, az = pz[i] + nz[i] * w0 * side;
-      const bx = px[j] + nx[j] * w1 * side, bz = pz[j] + nz[j] * w1 * side;
+  // The barrier lines are track.barriers (trackCore), the same lines the cars
+  // collide with: concrete blocks with a catch fence along the course, plain
+  // blocks down the escape roads and a tyre wall across each escape's end.
+  // One block per segment; W(a0, a1, ...) spans a0..a1 m behind the face.
+  let ucum = 0;
+  for (const { side, pts, src, kind } of track.barriers.loops) {
+    const m = src.length;
+    const V = (k) => [pts[(k % m) * 2], pts[(k % m) * 2 + 1]];
+    // outward unit normal at vertex k (mean of the adjacent segments')
+    const segOut = (k) => {
+      const [ax, az] = V(k), [bx, bz] = V(k + 1), l = Math.hypot(bx - ax, bz - az) || 1;
+      return [((bz - az) / l) * side, (-(bx - ax) / l) * side];
+    };
+    const vOut = (k) => {
+      const a = segOut((k - 1 + m) % m), b = segOut(k), l = Math.hypot(a[0] + b[0], a[1] + b[1]) || 1;
+      return [(a[0] + b[0]) / l, (a[1] + b[1]) / l];
+    };
+    const off = (k, o) => { const [x, z] = V(k), [ox, oz] = vOut(k % m); return [x + ox * o, z + oz * o]; };
+    let bannerRun = 0;
+    for (let k = 0; k < m; k++) {
+      const [ax, az] = V(k), [bx, bz] = V(k + 1);
       const mx = (ax + bx) / 2, mz = (az + bz) / 2;
-      if (!barrierAt(mx, mz)) { bannerRun = 0; continue; }
       const len = Math.hypot(bx - ax, bz - az) + 0.06;
       const rot = Math.atan2(bx - ax, bz - az);
-      const cy = (py[i] + py[j]) / 2;
+      const cy = kind[k] === 0 ? (py[src[k]] + py[src[(k + 1) % m]]) / 2 : groundY(mx, mz);
       const b = boxes(mx, mz);
       const W = (a0, a1, y0, y1, col, z0 = -len / 2, z1 = len / 2) => b.box(side > 0 ? a0 : -a1, y0, z0, side > 0 ? a1 : -a0, y1, z1, col, rot, mx, cy, mz);
-      const blockCol = Math.floor(i / BLOCK) % 2 ? '#cfccc4' : '#c4c1b9';
+      if (kind[k] === 2) {
+        const n = Math.max(1, Math.round(len / 0.9));
+        for (let q = 0; q < n; q++) {
+          for (let r = 0; r < 3; r++) {
+            const z0 = -len / 2 + (q * len) / n;
+            W(0, 0.84, r * 0.36, r * 0.36 + 0.34, (q + r + k) % 4 === 0 ? '#e8e8e8' : '#1d1d1f', z0 + 0.03, z0 + len / n - 0.03);
+          }
+        }
+        bannerRun = 0;
+        continue;
+      }
+      if (kind[k] === 1) {
+        W(0, 0.62, -0.3, 0.32, '#c9c6be');
+        W(0.12, 0.5, 0.32, 1.02, '#c9c6be');
+        bannerRun = 0;
+        continue;
+      }
+      const blockCol = k % 2 ? '#cfccc4' : '#c4c1b9';
       W(0, 0.62, -0.3, 0.32, blockCol);
       W(0.12, 0.5, 0.32, 1.02, blockCol);
-      if (hi || i % (BLOCK * 2) === 0) {
+      if (hi || k % 2 === 0) {
         // fence posts + rail on top of the barrier
-        if (i % (BLOCK * 2) === 0) W(0.28, 0.4, 1.02, 4.1, '#5c6166', -len / 2, -len / 2 + 0.12);
+        if (k % 2 === 0) W(0.28, 0.4, 1.02, 4.1, '#5c6166', -len / 2, -len / 2 + 0.12);
         W(0.3, 0.38, 3.98, 4.08, '#6c7176');
       }
-      if (hi) {
-        const o = 0.34 * side;
-        const fa = [ax + nx[i] * o, az + nz[i] * o], fb = [bx + nx[j] * o, bz + nz[j] * o];
-        fenceQuad(fa, fb, cy + 1.02, cy + 4.0, ucum, ucum + len / 1.2);
-      }
+      if (hi) fenceQuad(off(k, 0.34), off(k + 1, 0.34), cy + 1.02, cy + 4.0, ucum, ucum + len / 1.2);
       ucum += len / 1.2;
-      // sponsor banners on the road face along straights
-      const straight = Math.abs(track.curv[i]) < 0.004;
-      bannerRun = straight ? bannerRun + 1 : 0;
-      if (bannerRun >= 3 && (i / BLOCK) % 6 === 0) {
-        const k = (i - BLOCK * 2 + N) % N;
-        const wk = side > 0 ? track.wallL[k] : track.wallR[k];
-        const o = -0.03 * side;
-        const p0 = [px[k] + nx[k] * (wk * side + o), pz[k] + nz[k] * (wk * side + o)];
-        const p1 = [bx + nx[j] * o, bz + nz[j] * o];
+      // sponsor banners on the road face along straights, three blocks long
+      bannerRun = Math.abs(track.curv[src[k]]) < 0.004 ? bannerRun + 1 : 0;
+      if (bannerRun >= 3 && k % 6 === 0) {
+        const p0 = off(k - 2 + m, -0.03), p1 = off(k + 1, -0.03);
         // orient so the banner reads left-to-right from the road
-        const row = Math.floor(hash2(i, side, 21) * ROWS);
+        const row = Math.floor(hash2(k, side, 21) * ROWS);
         if (side > 0) bannerQuad(p0, p1, cy + 0.05, cy + 0.95, row);
         else bannerQuad(p1, p0, cy + 0.05, cy + 0.95, row);
       }
-    }
-  }
-  // escape roads: side barriers and a tyre wall at the end
-  for (const e of track.escapes) {
-    const b = boxes(e.x + e.dx * e.len * 0.5, e.z + e.dz * e.len * 0.5);
-    const rot = Math.atan2(e.dx, e.dz);
-    for (let s = 0; s < e.len; s += 4) {
-      for (const sd of [1, -1]) {
-        const cx = e.x + e.dx * (s + 2) + e.nx * sd * (e.hw + 0.31), cz = e.z + e.dz * (s + 2) + e.nz * sd * (e.hw + 0.31);
-        if (inCourse(cx, cz, -0.2)) continue;
-        b.box(-0.31, -0.3, -2.03, 0.31, 0.32, 2.03, '#c9c6be', rot, cx, groundY(cx, cz), cz);
-        b.box(-0.19, 0.32, -2.03, 0.19, 1.02, 2.03, '#c9c6be', rot, cx, groundY(cx, cz), cz);
-      }
-    }
-    // tyre wall
-    const ex = e.x + e.dx * (e.len + 0.8), ez = e.z + e.dz * (e.len + 0.8), ey = groundY(ex, ez);
-    for (let k = -Math.floor(e.hw); k <= Math.floor(e.hw); k++) for (let r = 0; r < 3; r++) {
-      b.box(-0.42, r * 0.36, -0.42, 0.42, r * 0.36 + 0.34, 0.42, (k + r) % 4 === 0 ? '#e8e8e8' : '#1d1d1f', rot, ex + e.nx * k * 0.9, ey, ez + e.nz * k * 0.9);
     }
   }
   if (fencePos.length) {
@@ -609,20 +600,72 @@ export function buildCityScene(track, opts = {}) {
   mod.prepare?.(ctx);
 
   // ---- buildings ---------------------------------------------------------------------------------
+  const pip = (x, z, pts) => {
+    let c = false;
+    const n = pts.length / 2;
+    for (let a = 0, b = n - 1; a < n; b = a++) {
+      const ax = pts[a * 2], az = pts[a * 2 + 1], bx = pts[b * 2], bz = pts[b * 2 + 1];
+      if ((az > z) !== (bz > z) && x < ((bx - ax) * (z - az)) / (bz - az) + ax) c = !c;
+    }
+    return c;
+  };
+  const shown = city.buildings.map((b) => {
+    if (b.removed) return false;
+    if (!hi && b.far && b.h < 160) return false;
+    // low: drop the low-rise back rows (mostly hidden behind the street frontage)
+    if (!hi && !b.far && b.h < 40 && nearest(b.cx, b.cz, 70) < 0) return false;
+    // never inside the course: footprints from OSM sometimes overhang the kerb line
+    if (!b.far && inCourse(b.cx, b.cz, 0.5)) return false;
+    return true;
+  });
+  // Building parts that start above the ground (min_height) stand on other
+  // parts. Where those aren't drawn the part would float: its supports were
+  // dropped above (low quality, kerb overhang), or never fetched (the skyline
+  // beyond the course only has the tall parts of its towers). Such a part is
+  // drawn down to the ground instead. Parts with no support in the data near
+  // the course (arcades, canopies) stay as they are; buildings a city module
+  // replaced with a landmark still count as support.
+  const grounded = new Set();
+  {
+    const G = 60, grid = new Map();
+    const cellsOf = (b) => {
+      let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+      for (let q = 0; q < b.pts.length; q += 2) { x0 = Math.min(x0, b.pts[q]); x1 = Math.max(x1, b.pts[q]); z0 = Math.min(z0, b.pts[q + 1]); z1 = Math.max(z1, b.pts[q + 1]); }
+      const out = [];
+      for (let a = Math.floor(x0 / G); a <= Math.floor(x1 / G); a++) for (let c = Math.floor(z0 / G); c <= Math.floor(z1 / G); c++) out.push(skey(a, c));
+      return out;
+    };
+    city.buildings.forEach((b, k) => {
+      for (const key of cellsOf(b)) {
+        if (!grid.has(key)) grid.set(key, []);
+        grid.get(key).push(k);
+      }
+    });
+    const overlaps = (P, S) => {
+      if (pip(P.cx, P.cz, S.pts) || pip(S.cx, S.cz, P.pts)) return true;
+      for (let q = 0; q < P.pts.length; q += 2) if (pip(P.pts[q], P.pts[q + 1], S.pts)) return true;
+      return false;
+    };
+    // does a building ok(k) stand under part P (index kp), up to within 2 m of its underside?
+    const supported = (P, kp, ok) => cellsOf(P).some((key) => (grid.get(key) || []).some((k) => {
+      const S = city.buildings[k];
+      return k !== kp && ok(k) && S.minH < P.minH && S.h >= P.minH - 2 && overlaps(P, S);
+    }));
+    city.buildings.forEach((b, k) => {
+      if (!shown[k] || b.minH <= 0.5) return;
+      if (supported(b, k, (s) => shown[s] || city.buildings[s].removed)) return;
+      if (b.far || supported(b, k, () => true)) grounded.add(k);
+    });
+  }
   let nBld = 0;
   city.buildings.forEach((b, k) => {
-    if (b.removed) return;
-    if (!hi && b.far && b.h < 160) return;
+    if (!shown[k]) return;
     const near = nearest(b.cx, b.cz, 130) >= 0;
-    // low: drop the low-rise back rows (mostly hidden behind the street frontage)
-    if (!hi && !b.far && b.h < 40 && nearest(b.cx, b.cz, 70) < 0) return;
-    // never inside the course: footprints from OSM sometimes overhang the kerb line
-    if (!b.far && inCourse(b.cx, b.cz, 0.5)) return;
     let base = Infinity;
     for (let q = 0; q < b.pts.length; q += 2) base = Math.min(base, groundY(b.pts[q], b.pts[q + 1]));
     // city modules may pick facade styles and roofs (mod.styleFor / mod.buildingOpts)
     const st = mod.styleFor?.(b, k) ?? styleFor(b, k);
-    addBuilding(chunk(b.cx, b.cz, b.far ? CH * 4 : CHQ).fac, b, base, {
+    addBuilding(chunk(b.cx, b.cz, b.far ? CH * 4 : CHQ).fac, grounded.has(k) ? { ...b, minH: 0 } : b, base, {
       style: st, seed: k,
       shop: !b.part && b.minH === 0 && b.h > 9 && (hi ? near : nearest(b.cx, b.cz, 45) >= 0) && !b.church,
       cornice: hi && near && b.h < 90 && (st === STYLE.limestone || st === STYLE.brick || st === STYLE.brownstone || st === STYLE.white),
@@ -644,15 +687,6 @@ export function buildCityScene(track, opts = {}) {
     if (th.treeLod && nearest(x, z, th.treeLod) < 0) props.simpleTree(boxes(x, z), x, y, z, seed, sc * (park ? 1.25 : 1));
     else if (park) props.parkTree(boxes(x, z), x, y, z, seed, sc);
     else props.streetTree(boxes(x, z), x, y, z, seed, sc);
-  };
-  const pip = (x, z, pts) => {
-    let c = false;
-    const n = pts.length / 2;
-    for (let a = 0, b = n - 1; a < n; b = a++) {
-      const ax = pts[a * 2], az = pts[a * 2 + 1], bx = pts[b * 2], bz = pts[b * 2 + 1];
-      if ((az > z) !== (bz > z) && x < ((bx - ax) * (z - az)) / (bz - az) + ax) c = !c;
-    }
-    return c;
   };
   const inPark = (x, z) => parkPolys.some((a) => pip(x, z, a.pts));
   city.pois.forEach((p, k) => {

@@ -1,7 +1,9 @@
 // Scenic screenshots of a track from fixed camera positions along the lap
 // (landmarks, corners, skyline). Boots the built game, starts a race, parks
 // the player at each spot and takes over the camera.
-// Usage: node tests/views.mjs [outDir] [trackId] [quality]
+// Usage: node tests/views.mjs [outDir] [trackId] [quality] [set]
+//   set: 'views' (default, VIEWS below) or 'corners' (CORNERS: high views down
+//        onto the hard corners and escape roads, to check the barriers)
 //   views come from VIEWS[trackId] below: [name, where, options]
 //   where: lap fraction, or [lat, lon] of a landmark on a city course (the
 //          camera then stands on the course near it and looks at it)
@@ -19,6 +21,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = process.argv[2] || path.join(root, 'tests/out/views');
 const trackId = process.argv[3] || 'nyc';
 const quality = process.argv[4] || 'high';
+const set = process.argv[5] || 'views';
 fs.mkdirSync(outDir, { recursive: true });
 
 const VIEWS = {
@@ -68,6 +71,27 @@ const VIEWS = {
     ['m18-sol-from-above', [40.41690, -3.70370], { h: 45, back: 120, side: 0, lookUp: 0 }],
   ],
 };
+// the hard corners and escape roads (see tests/bounds.mjs), from above
+const TOP = { h: 34, back: 30, ahead: 6, lookUp: 0 };
+const CORNERS = {
+  nyc: [
+    ['c1-library-corner', 0.2689, TOP], ['c2-times-square', 0.3988, TOP], ['c3-carnegie-hall', 0.6479, TOP],
+    ['c4-broadway', 0.6794, TOP], ['c5-columbus-circle', 0.746, { h: 45, back: 40, ahead: 10 }], ['c6-grand-army-plaza', 0.9636, TOP],
+  ],
+  tokyo: [
+    ['c1-akasaka-mitsuke-jog', 0.1059, TOP], ['c2-akasaka-mitsuke', 0.1955, TOP], ['c3-s1698', 0.3223, TOP],
+    ['c4-shinanomachi', 0.7764, TOP], ['c5-aoyama-itchome', 0.9499, TOP],
+  ],
+  madrid: [
+    ['c1-cibeles', 0.2874, TOP], ['c2-neptuno', 0.3755, TOP], ['c3-almudena', 0.7332, TOP],
+    ['c4-plaza-de-espana', 0.8884, TOP], ['c5-edificio-espana', 0.9403, TOP],
+    // the Calle Mayor escape road at Almudena: chase view toward the dome from the
+    // corner and from the end of the escape road, then from above
+    ['c6-almudena-corner-chase', 0.7332, { chase: true, at: [40.415056, -3.713474], face: [40.4156, -3.71455] }],
+    ['c7-almudena-escape-end-chase', 0.7332, { chase: true, at: [40.415046, -3.713993], face: [40.4156, -3.71455] }],
+    ['c8-almudena-escape-aerial', 0.7332, { cam: [40.41435, -3.71335, 40], look: [40.415049, -3.713761] }],
+  ],
+};
 const origin = CITY_DATA[trackId]?.origin;
 const project = ([lat, lon]) => [(lon - origin.lon) * origin.kx, -(lat - origin.lat) * origin.ky];
 
@@ -87,23 +111,39 @@ try {
   await page.evaluate((t) => window.__vgt.startRace({ mode: 'timetrial', car: 'nsxr', paint: 0, track: t }), trackId);
   await page.waitForFunction(() => window.__vgt.app === 'race', null, { timeout: 120000 });
   await page.waitForTimeout(2000);
-  for (const [name, where, o] of VIEWS[trackId] || []) {
+  for (const [name, where, o] of (set === 'corners' ? CORNERS : VIEWS)[trackId] || []) {
     const target = Array.isArray(where) ? project(where) : null;
-    await page.evaluate(([u, o, target]) => {
+    // o.at / o.face: put the car at [lat, lon] facing [lat, lon] (chase camera);
+    // o.cam / o.look: camera at [lat, lon, height above the course] looking at [lat, lon]
+    const P = (ll) => (ll ? project(ll) : null);
+    await page.evaluate(([u, o, target, at, face, cam0, look]) => {
       const r = window.__vgt.race, cam = window.__vgt.camera, tr = r.track;
       const s = target ? tr.locate(target[0], target[1]).s : u * tr.length;
       const rc = r.player;
       rc.placeAt(s, o.off || 0);
+      if (at) {
+        const l = tr.locate(at[0], at[1], rc.loc.i);
+        rc.veh.reset(at[0], at[1], Math.atan2(face[0] - at[0], face[1] - at[1]), l.y);
+        rc.loc = tr.locate(at[0], at[1], l.i);
+        rc.hint = rc.loc.i;
+        rc.safe.ok = false;
+      }
       rc.frozen = true;
       r.rig.__update ??= r.rig.update;
       if (o.chase) { r.rig.update = r.rig.__update; r.rig.inited = false; return; } // the game's own chase camera
-      const p = tr.sample(s - (o.back ?? 10), o.side || 0);
-      const q = target ? { x: target[0], z: target[1], y: tr.sample(s, 0).y } : tr.sample(s + (o.ahead ?? 40), o.lookOff || 0);
       r.rig.update = () => {};
-      cam.position.set(p.x, p.y + (o.h ?? 3), p.z);
-      cam.lookAt(q.x, q.y + (o.lookUp ?? 0), q.z);
+      if (cam0) {
+        const y = tr.locate(cam0[0], cam0[1]).y;
+        cam.position.set(cam0[0], y + cam0[2], cam0[1]);
+        cam.lookAt(look[0], tr.locate(look[0], look[1]).y + (o.lookUp ?? 0), look[1]);
+      } else {
+        const p = tr.sample(s - (o.back ?? 10), o.side || 0);
+        const q = target ? { x: target[0], z: target[1], y: tr.sample(s, 0).y } : tr.sample(s + (o.ahead ?? 40), o.lookOff || 0);
+        cam.position.set(p.x, p.y + (o.h ?? 3), p.z);
+        cam.lookAt(q.x, q.y + (o.lookUp ?? 0), q.z);
+      }
       cam.updateMatrixWorld();
-    }, [Array.isArray(where) ? 0 : where, o, target]);
+    }, [Array.isArray(where) ? 0 : where, o, target, P(o.at), P(o.face), o.cam ? [...project(o.cam), o.cam[2]] : null, P(o.look)]);
     await page.waitForTimeout(1500);
     await page.screenshot({ path: path.join(outDir, name + '.png') });
     console.log('  shot', name);

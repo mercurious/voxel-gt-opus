@@ -110,14 +110,16 @@ export function buildTrackScene(track, opts = {}) {
     wallB = new BoxBuilder();
   };
   const wallStyle = th.wall;
-  for (let i = 0; i < N; i++) {
-    if (i % CHUNK === 0) flushWall();
-    const j = (i + 1) % N;
-    for (const side of [1, -1]) {
-      const w0 = side > 0 ? track.wallL[i] : track.wallR[i];
-      const w1 = side > 0 ? track.wallL[j] : track.wallR[j];
-      const ax = px[i] + nx[i] * w0 * side, az = pz[i] + nz[i] * w0 * side;
-      const bx = px[j] + nx[j] * w1 * side, bz = pz[j] + nz[j] * w1 * side;
+  // the barrier lines are track.barriers (trackCore), the ones the cars hit:
+  // a vertex per course sample (src), folds on the inside of tight corners cut
+  let nw = 0;
+  for (const { side, pts, src } of track.barriers.loops) {
+    const m = src.length;
+    for (let k = 0; k < m; k++) {
+      if (nw++ % CHUNK === 0) flushWall();
+      const k2 = (k + 1) % m, i = src[k], j = src[k2];
+      const ax = pts[k * 2], az = pts[k * 2 + 1];
+      const bx = pts[k2 * 2], bz = pts[k2 * 2 + 1];
       const len = Math.hypot(bx - ax, bz - az) + 0.08;
       const rot = Math.atan2(bx - ax, bz - az);
       const cx = (ax + bx) / 2, cz = (az + bz) / 2, cy = (py[i] + py[j]) / 2;

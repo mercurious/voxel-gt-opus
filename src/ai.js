@@ -36,20 +36,37 @@ export class AIDriver {
         if ((closing > -1 || gap < 9) && gap < bestGap) { bestGap = gap; blocker = o; }
       }
     }
+    // the tightest room either side over the stretch ahead: a line aimed past
+    // a kerb corner that steps into the road would clip it
+    const look = clamp(7 + v * 0.42, 9, 42);
+    const nAhead = Math.round(look / ds) + 2;
+    const minRoom = (room, n) => { let m = Infinity; for (let k = 0; k <= n; k++) m = Math.min(m, room[(loc.i + k) % N]); return m; };
+    let boxedIn = false;
     if (blocker) {
-      const roomL = loc.edgeL - 1.4, roomR = loc.edgeR - 1.4;
+      // pass the blocker on the side with more room (else the other side),
+      // in a slot clear of every car alongside or just ahead and inside the
+      // room the barriers leave over the stretch ahead. Neither side free:
+      // tuck in behind the blocker.
+      const roomL = minRoom(tr.roomL, nAhead + 10) - 1.4, roomR = minRoom(tr.roomR, nAhead + 10) - 1.4;
+      const near = [];
+      for (const o of cars) {
+        if (o === rc || !o.loc) continue;
+        let gap = o.loc.s - loc.s;
+        if (gap < -tr.length / 2) gap += tr.length;
+        if (gap > tr.length / 2) gap -= tr.length;
+        if (gap > -5 && gap < 28 + v * 0.4) near.push(o.loc.d);
+      }
       const od = blocker.loc.d;
-      // go to whichever side has more space
-      const leftSpace = roomL - od, rightSpace = od + roomR;
-      const want = leftSpace > rightSpace ? od + 2.6 : od - 2.6;
-      this.passTarget = clamp(want - tr.lineOff[loc.i], -roomR * 2, roomL * 2);
+      const sides = roomL - od > od + roomR ? [od + 2.6, od - 2.6] : [od - 2.6, od + 2.6];
+      let best = sides.find((c) => c >= -roomR && c <= roomL && near.every((d) => Math.abs(d - c) >= 2.4));
+      if (best === undefined) { boxedIn = true; best = clamp(loc.d, -roomR, roomL); }
+      this.passTarget = best - tr.lineOff[loc.i];
     } else this.passTarget *= Math.pow(0.4, dt);
     this.passOff = lerp(this.passOff, this.passTarget, 1 - Math.exp(-dt * 2.2));
 
     // ---- steering: pure pursuit -------------------------------------------
-    const look = clamp(7 + v * 0.42, 9, 42);
     const iT = (loc.i + Math.round(look / ds)) % N;
-    const off = clamp(tr.lineOff[iT] + this.passOff, -(tr.edgeR[iT] - 1.1), tr.edgeL[iT] - 1.1);
+    const off = clamp(tr.lineOff[iT] + this.passOff, -(minRoom(tr.roomR, nAhead) - 1.1), minRoom(tr.roomL, nAhead) - 1.1);
     const txp = tr.px[iT] + tr.nx[iT] * off, tzp = tr.pz[iT] + tr.nz[iT] * off;
     const dx = txp - veh.x, dz = tzp - veh.z;
     const fx = Math.sin(veh.h), fz = Math.cos(veh.h);
@@ -66,18 +83,23 @@ export class AIDriver {
 
     // ---- speed -------------------------------------------------------------
     // Brake on the deceleration needed to meet the profile anywhere in the
-    // next stretch of track, not just at one look-ahead point.
+    // next stretch of track, not just at one look-ahead point. Off the racing
+    // line (passing) the path on the inside of a bend is tighter: radius
+    // 1/k - offset, so the speed there scales by sqrt(1 - k * offset).
     const capDecel = 9.81 * rc.spec.grip * 1.1 * 0.82 * rc.spec.brake;
-    let vt = this.profile[(loc.i + Math.round((2 + v * 0.1) / ds)) % N];
+    const tight = (j) => Math.sqrt(clamp(1 - tr.lineCurv[j] * this.passOff, 0.25, 1));
+    const i0 = (loc.i + Math.round((2 + v * 0.1) / ds)) % N;
+    let vt = this.profile[i0] * tight(i0);
     let need = 0;
     const scan = Math.round((20 + v * v / 14) / ds);
     for (let k = 2; k <= scan; k += 2) {
-      const vp = this.profile[(loc.i + k) % N] * this.pace;
+      const j = (loc.i + k) % N;
+      const vp = this.profile[j] * tight(j) * this.pace;
       if (vp < v) need = Math.max(need, (v * v - vp * vp) / (2 * k * ds));
     }
     if (this.passOff !== 0 && Math.abs(this.passOff) > 1.5) vt *= 0.985;
-    if (blocker && bestGap < 10 && Math.abs(blocker.loc.d - loc.d) < 2.2) vt = Math.min(vt, blocker.veh.vx - 0.5);
-    const offTrack = loc.d > loc.edgeL + 0.5 || -loc.d > loc.edgeR + 0.5;
+    if (blocker && ((boxedIn && bestGap < 20) || (bestGap < 10 && Math.abs(blocker.loc.d - loc.d) < 2.2))) vt = Math.min(vt, blocker.veh.vx - 0.5);
+    const offTrack = loc.d > loc.roomL + 0.5 || -loc.d > loc.roomR + 0.5;
     if (offTrack) vt = Math.min(vt, 22);
     vt *= this.pace;
     const err = vt - v;

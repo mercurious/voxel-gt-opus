@@ -249,11 +249,8 @@ export function buildTrack(def) {
       wallR[i] = Math.max(halfW + 2.5, Math.min(wr2[i], limR[i]));
     }
   }
-  // usable track either side of the centreline (racing line + AI limits):
-  // the painted edge on circuits, the barrier (less a margin) on streets.
   // Tight street corners keep extra room on the inside: pure pursuit cuts
   // the apex of a 90-degree turn by a metre or so.
-  const edgeL = new Float32Array(N), edgeR = new Float32Array(N);
   let inL = new Float32Array(N), inR = new Float32Array(N);
   if (def.street) {
     for (let i = 0; i < N; i++) {
@@ -263,29 +260,90 @@ export function buildTrack(def) {
     inL = smoothArr(inL, Math.round(6 / ds), 2);
     inR = smoothArr(inR, Math.round(6 / ds), 2);
   }
-  for (let i = 0; i < N; i++) {
-    edgeL[i] = def.street ? wallL[i] - 0.7 - inL[i] : hw[i];
-    edgeR[i] = def.street ? wallR[i] - 0.7 - inR[i] : hw[i];
-  }
 
   const track = {
     def, N, ds, length: L, px, pz, py, tx, tz, nx, nz, head, curv, slope,
-    halfW, hw, edgeL, edgeR, wallL, wallR, kerb: kerb2, surfL, surfR, crossings,
+    halfW, hw, edgeL: null, edgeR: null, roomL: null, roomR: null, roadL: wallL, roadR: wallR, wallL, wallR,
+    kerb: kerb2, surfL, surfR, crossings,
     escapes: buildEscapes(def),
+    barriers: null,
     lineOff: null, lineCurv: null,
   };
+  track.barriers = buildBarriers(track);
+  // roadL/roadR: how far the road surface reaches either side, out to the
+  // barrier line (cast along the normal; on streets the line can sit a little
+  // beyond the wall offset where saw-tooth was cut away). Where the ray finds
+  // no barrier nearby (an escape-road mouth) the wall offset.
+  // edgeL/edgeR, the usable track: the painted edge on circuits; on streets
+  // the barrier line less a margin.
+  // roomL/roomR, what the racing line and the AI may use: the same, but on
+  // streets pulled in ahead of and behind barrier corners that step into the
+  // road, by at most ROOM_SLOPE m sideways per metre along (no car follows a
+  // kerb corner square, and a line aimed past one runs into it).
+  if (def.street) {
+    const road = [new Float32Array(N), new Float32Array(N)], edges = [new Float32Array(N), new Float32Array(N)];
+    for (const [k, side, wall, inner] of [[0, 1, wallL, inL], [1, -1, wallR, inR]]) {
+      for (let i = 0; i < N; i++) {
+        const cap = wall[i] + NOTCH_DEPTH + 1, ray = barrierRay(track, i, side, cap);
+        road[k][i] = ray < cap ? Math.max(wall[i], ray) : wall[i];
+        edges[k][i] = Math.min(wall[i], ray) - 0.7 - inner[i];
+      }
+    }
+    [track.roadL, track.roadR] = road;
+    [track.edgeL, track.edgeR] = edges;
+    [track.roomL, track.roomR] = edges.map((e) => slopeLimit(e, ds));
+  } else {
+    track.edgeL = Float32Array.from(hw);
+    track.edgeR = Float32Array.from(hw);
+    track.roomL = track.edgeL;
+    track.roomR = track.edgeR;
+  }
   computeRacingLine(track);
   track.locate = (x, z, hint) => locate(track, x, z, hint);
   track.sample = (s, off) => sampleAt(track, s, off);
   return track;
 }
 
-// Street barriers: march out along each normal while still inside the union
-// of the course's street rectangles (def.corridor = flat [x0,z0,x1,z1,halfW]),
-// so straights get a barrier on the kerb line and 90-degree corners open up
-// to the whole intersection box. The barrier face sits 0.5 m inside the kerb.
+// Distance from course sample i along its normal on `side` to the first
+// barrier segment of that side's line (or maxT).
+const rayNear = [];
+function barrierRay(t, i, side, maxT) {
+  const B = t.barriers, dx = t.nx[i] * side, dz = t.nz[i] * side, ox = t.px[i], oz = t.pz[i];
+  const nLeft = B.loops[0].src.length;
+  const cnt = barriersNear(B, ox + dx * maxT * 0.5, oz + dz * maxT * 0.5, maxT * 0.5 + 0.5, rayNear);
+  let best = maxT;
+  for (let q = 0; q < cnt; q++) {
+    const s = rayNear[q];
+    if ((s < nLeft) !== (side > 0)) continue;
+    const u = segIntersect(ox, oz, ox + dx * maxT, oz + dz * maxT, B.ax[s], B.az[s], B.bx[s], B.bz[s]);
+    if (u !== null) best = Math.min(best, u * maxT);
+  }
+  return best;
+}
+
+// Lower envelope of a closed per-sample offset with its slope limited to
+// ROOM_SLOPE: steps become ramps that start early, never later.
+const ROOM_SLOPE = 0.33;
+function slopeLimit(e, ds) {
+  const N = e.length, K = 20, out = Float32Array.from(e);
+  for (let i = 0; i < N; i++) {
+    for (let j = 1; j <= K; j++) {
+      const r = ROOM_SLOPE * j * ds;
+      out[i] = Math.min(out[i], e[(i + j) % N] + r, e[(i - j + N) % N] + r);
+    }
+  }
+  return out;
+}
+
+// Street barriers: cast a ray out along each normal and find where it leaves
+// the union of the course's street rectangles (def.corridor = flat
+// [x0,z0,x1,z1,halfW], each extended by halfW past its ends), exactly, so
+// straights get a barrier on the kerb line and 90-degree corners open up to
+// the whole intersection box with clean straight runs and corner points. The
+// barrier face sits 0.5 m inside the kerb, never inside the course's own kerb
+// line (hw), and clear of other parts of the course (lim).
 function streetWalls(def, t) {
-  const { N, ds, px, pz, nx, nz, hw, limL, limR } = t;
+  const { N, px, pz, nx, nz, hw, limL, limR } = t;
   const segs = [];
   const grid = new Grid(40);
   const c = def.corridor;
@@ -296,38 +354,44 @@ function streetWalls(def, t) {
     segs.push({ x0, z0, ux: (x1 - x0) / L, uz: (z1 - z0) / L, L, h });
     for (let s = 0; s <= L + 20; s += 20) grid.add(x0 + segs[si].ux * Math.min(s, L), z0 + segs[si].uz * Math.min(s, L), si);
   }
-  const inside = (x, z) => {
-    let hit = false;
-    grid.query(x, z, 45, (si) => {
-      if (hit) return;
-      const s = segs[si];
-      const dx = x - s.x0, dz = z - s.z0;
-      const a = dx * s.ux + dz * s.uz, lat = dz * s.ux - dx * s.uz;
-      if (a >= -s.h && a <= s.L + s.h && Math.abs(lat) <= s.h) hit = true;
-    });
-    return hit;
-  };
   const cap = def.wallCap || 20, gap = 0.5;
+  // distance along the ray (ox, oz) + t (dx, dz), from t0, to where it leaves the union
+  const iv = [];
+  const exit = (ox, oz, dx, dz, t0) => {
+    iv.length = 0;
+    grid.query(ox + dx * cap * 0.5, oz + dz * cap * 0.5, 45 + cap * 0.5, (si) => {
+      const s = segs[si];
+      const a0 = (ox - s.x0) * s.ux + (oz - s.z0) * s.uz, da = dx * s.ux + dz * s.uz;
+      const l0 = (oz - s.z0) * s.ux - (ox - s.x0) * s.uz, dl = dz * s.ux - dx * s.uz;
+      let lo = -Infinity, hi = Infinity;
+      for (const [p, dp, a, b] of [[a0, da, -s.h, s.L + s.h], [l0, dl, -s.h, s.h]]) {
+        if (Math.abs(dp) < 1e-9) { if (p < a || p > b) return; continue; }
+        const u = (a - p) / dp, v = (b - p) / dp;
+        lo = Math.max(lo, Math.min(u, v)); hi = Math.min(hi, Math.max(u, v));
+      }
+      if (hi > lo) iv.push(lo, hi);
+    });
+    let d = t0;
+    for (let grown = true; grown && d < cap;) {
+      grown = false;
+      for (let q = 0; q < iv.length; q += 2) if (iv[q] <= d + 1e-6 && iv[q + 1] > d + 1e-6) { d = iv[q + 1]; grown = true; }
+    }
+    return Math.min(d, cap);
+  };
+  const lim = [limL, limR];
   const out = [new Float32Array(N), new Float32Array(N)];
   for (let i = 0; i < N; i++) {
     for (const [k, side] of [[0, 1], [1, -1]]) {
-      let d = hw[i];
-      while (d < cap && inside(px[i] + nx[i] * side * (d + 0.25), pz[i] + nz[i] * side * (d + 0.25))) d += 0.25;
-      out[k][i] = d - gap;
+      out[k][i] = Math.min(lim[k][i], exit(px[i], pz[i], nx[i] * side, nz[i] * side, hw[i]) - gap);
     }
   }
-  // round off the intersection-box corners, never inside the kerb line
-  const lim = [limL, limR];
-  return out.map((w, k) => {
-    const s = smoothArr(w, Math.round(3 / ds), 2);
-    for (let i = 0; i < N; i++) s[i] = Math.min(lim[k][i], Math.max(hw[i] - gap, Math.min(s[i], w[i] + 1)));
-    return s;
-  });
+  return out;
 }
 
 // Escape roads: oriented rectangles (side-street stubs) the car may enter
 // where a barrier opens. def.escapes = [{x, z, dx, dz, hw, len}]: mouth centre,
-// unit direction, half-width and length.
+// unit direction, half-width and length. buildBarriers() splices each into the
+// barrier line and drops any it can't splice cleanly.
 function buildEscapes(def) {
   return (def.escapes || []).map((e) => ({ ...e, nx: -e.dz, nz: e.dx }));
 }
@@ -342,12 +406,384 @@ export function escapeAt(track, x, z, margin = 0) {
   return null;
 }
 
+// ---- barriers ----------------------------------------------------------------
+// The one barrier definition: sim.js collides with it, trackScene/cityScene
+// draw it. A closed polyline either side of the course, in race order, along
+// the wall offsets of every sample, with the folds offsets make on the inside
+// of tight corners cut out and each escape road spliced in as a detour down
+// its side street, closed by an end wall. Escapes that can't be spliced
+// cleanly are dropped, so the barrier stays closed there. Street loops are
+// thinned to straight runs of <= SEG_MAX m (one concrete block each).
+//   loops[k] = { side (+1 left, -1 right), pts [x0, z0, ...], src (course
+//               sample per vertex, for heights), kind (per segment) }
+//   flat per segment s (vertex a -> b): ax az bx bz, inward unit normal nx nz
+//   (toward the drivable side), len, y (course height), kind (0 wall,
+//   1 escape side, 2 escape end), want (heading a glancing hit steers toward,
+//   NaN for none), convex (vertex a juts into the drivable side; vnx vnz is
+//   its normal, the mean of its two faces'), over (near a place where the
+//   course crosses itself on a bridge: only there does height decide whether
+//   a car meets the segment; everywhere else containment is purely 2D)
+// Query segments near a point with barriersNear().
+const SEG_MAX = 4.2;
+const BCELL = 8;
+const OVER_SPAN = 50; // samples either side of a bridge crossing
+const bkey = (cx, cz) => (cx + 32768) * 65536 + (cz + 32768);
+
+function buildBarriers(t) {
+  const { def, N, px, pz, nx, nz, wallL, wallR } = t;
+  const loops = [];
+  for (const side of [1, -1]) {
+    const w = side > 0 ? wallL : wallR;
+    const P = [];
+    // vertex: position, course sample, kind + want heading of the segment it starts
+    for (let i = 0; i < N; i++) P.push({ x: px[i] + nx[i] * w[i] * side, z: pz[i] + nz[i] * w[i] * side, i, k: 0, h: NaN });
+    loops.push({ side, P: def.street ? untangle(dropNotches(untangle(P), side)) : untangle(P) });
+  }
+  const course = loops.map((l) => l.P);
+  t.escapes = t.escapes.filter((e) => spliceEscape(t, loops, course, e));
+  // streets: one concrete block per segment; circuits keep a vertex per sample
+  if (def.street) {
+    for (const l of loops) l.P = subdivide(dropNotches(thin(dropShort(l.P, 0.6), 0.05, SEG_MAX), l.side), SEG_MAX);
+  }
+  return packBarriers(t, loops);
+}
+
+// Signed turn at vertex k of a closed barrier line on `side`: < 0 where the
+// line bends away from the road there (the vertex juts into the road), > 0
+// where it bends toward it.
+function barrierTurn(P, k, side) {
+  const n = P.length, a = P[(k - 1 + n) % n], b = P[k], c = P[(k + 1) % n];
+  const ux = b.x - a.x, uz = b.z - a.z, vx = c.x - b.x, vz = c.z - b.z;
+  return side * Math.atan2(ux * vz - uz * vx, ux * vx + uz * vz);
+}
+
+// Street outlines are unions of straight street rectangles, so where a street
+// bends gently or changes width the rectangles' corners leave a saw-tooth of
+// steps along the kerb. A vertex that juts into the road with a vertex bending
+// back toward it within NOTCH_SPAN m is such a step (a real kerb corner has
+// straight runs either side). notchAt() returns how far the vertex juts out of
+// the line through its neighbouring corners (0: not a notch); dropNotches()
+// removes it, so the line only ever moves away from the road, onto the outer
+// rectangle corners: the outer kerb of the bend.
+export const NOTCH_SPAN = 4;
+const NOTCH_DEPTH = 3, NOTCH_TURN = 0.02;
+export function notchAt(P, k, side) {
+  if (barrierTurn(P, k, side) > -NOTCH_TURN) return 0;
+  const n = P.length, at = (q) => P[((q % n) + n) % n];
+  let found = false;
+  const nb = [];
+  for (const dir of [1, -1]) {
+    let dist = 0, q = k;
+    nb.push(at(k + dir));
+    for (let s = 1; s < n; s++) {
+      dist += Math.hypot(at(k + dir * s).x - at(k + dir * (s - 1)).x, at(k + dir * s).z - at(k + dir * (s - 1)).z);
+      if (dist > NOTCH_SPAN) break;
+      const tn = barrierTurn(P, ((k + dir * s) % n + n) % n, side);
+      if (Math.abs(tn) >= NOTCH_TURN) {
+        if (q === k) { q = k + dir * s; nb[nb.length - 1] = at(q); } // the next corner either side
+        if (tn > NOTCH_TURN) { found = true; break; }
+      }
+    }
+  }
+  if (!found) return 0;
+  const [c, a] = nb, b = P[k];
+  const vx = c.x - a.x, vz = c.z - a.z, l = Math.hypot(vx, vz) || 1;
+  return Math.abs((b.x - a.x) * vz - (b.z - a.z) * vx) / l;
+}
+function dropNotches(P, side) {
+  for (let pass = 0, changed = true; changed && pass < 200; pass++) {
+    changed = false;
+    for (let k = 0; k < P.length; k++) {
+      if (P[k].k === 2 || P[(k - 1 + P.length) % P.length].k === 2) continue; // keep the end walls square
+      const d = notchAt(P, k, side);
+      if (d > 0 && d <= NOTCH_DEPTH) { P.splice(k, 1); k = Math.max(-1, k - 3); changed = true; }
+    }
+  }
+  return P;
+}
+
+// Cut self-intersection loops out of a closed polyline (offsets wider than the
+// corner radius fold back on themselves) and drop doubled-back spikes.
+function untangle(P, W = 40) {
+  for (let pass = 0; pass < 64; pass++) {
+    const n = P.length;
+    let cut = null;
+    for (let k = 0; k < n && !cut; k++) {
+      const a = P[k], b = P[(k + 1) % n];
+      for (let m = Math.min(W, n - 3); m >= 2; m--) {
+        const c = P[(k + m) % n], d = P[(k + m + 1) % n];
+        const tt = segIntersect(a.x, a.z, b.x, b.z, c.x, c.z, d.x, d.z);
+        if (tt !== null) { cut = { k, m, x: lerp(a.x, b.x, tt), z: lerp(a.z, b.z, tt) }; break; }
+      }
+    }
+    let changed = false;
+    if (cut) {
+      // P[k] -> crossing -> P[k+m+1]: the loop between them goes
+      const { k, m } = cut;
+      const out = [];
+      for (let q = (k + m + 1) % n; ; q = (q + 1) % n) { out.push(P[q]); if (q === k) break; }
+      out.push({ ...P[(k + m) % n], x: cut.x, z: cut.z });
+      P = out;
+      changed = true;
+    }
+    for (let k = 0; k < P.length && P.length > 3; k++) {
+      const n2 = P.length, a = P[(k - 1 + n2) % n2], b = P[k], c = P[(k + 1) % n2];
+      const ux = b.x - a.x, uz = b.z - a.z, vx = c.x - b.x, vz = c.z - b.z;
+      const lu = Math.hypot(ux, uz), lv = Math.hypot(vx, vz);
+      if (lu < 1e-3 || ux * vx + uz * vz < -0.5 * lu * lv) { P.splice(k, 1); k = Math.max(-1, k - 2); changed = true; }
+    }
+    if (!changed) break;
+  }
+  return P;
+}
+
+// Fold segments shorter than minLen into a neighbour of the same kind (the
+// little jogs left where a barrier meets an escape road's side wall).
+function dropShort(P, minLen) {
+  for (let k = 0; k < P.length && P.length > 3; k++) {
+    const n = P.length, a = P[k], b = P[(k + 1) % n];
+    if (Math.hypot(b.x - a.x, b.z - a.z) >= minLen) continue;
+    if (b.k === a.k) P.splice((k + 1) % n, 1);
+    else if (P[(k - 1 + n) % n].k === a.k) P.splice(k, 1);
+    else continue;
+    k = Math.max(-1, k - 2);
+  }
+  return P;
+}
+
+// even-odd: inside the region bounded by these closed polylines?
+function inLoops(loops, x, z) {
+  let c = false;
+  for (const P of loops) {
+    for (let k = 0, n = P.length; k < n; k++) {
+      const a = P[k], b = P[(k + 1) % n];
+      if ((a.z > z) !== (b.z > z) && x < ((b.x - a.x) * (z - a.z)) / (b.z - a.z) + a.x) c = !c;
+    }
+  }
+  return c;
+}
+
+// Splice escape e into the barrier loop that crosses its mouth: the stretch of
+// barrier inside the escape rectangle is replaced by the rectangle's outline
+// on the far side of that barrier (side walls and end wall). course = the
+// unspliced loops. Returns false (escape dropped) if no loop takes it cleanly.
+function spliceEscape(t, loops, course, e) {
+  const N = t.N;
+  let mouth = 0;
+  for (let i = 0, bd = Infinity; i < N; i++) { const d = (t.px[i] - e.x) ** 2 + (t.pz[i] - e.z) ** 2; if (d < bd) { bd = d; mouth = i; } }
+  const loc = (x, z) => [(x - e.x) * e.dx + (z - e.z) * e.dz, (x - e.x) * e.nx + (z - e.z) * e.nz];
+  const world = (al, la) => [e.x + e.dx * al + e.nx * la, e.z + e.dz * al + e.nz * la];
+  // outline corners (along, lat); edges C0->C1 mouth, C1->C2 side, C2->C3 end, C3->C0 side
+  const C = [[0, -e.hw], [0, e.hw], [e.len, e.hw], [e.len, -e.hw]];
+  const perim = (p) => {
+    const ed = Math.floor(p) % 4, u = p - Math.floor(p), [ca, cl] = C[ed], [da, dl] = C[(ed + 1) % 4];
+    return [ca + (da - ca) * u, cl + (dl - cl) * u];
+  };
+  const heading = Math.atan2(e.dx, e.dz);
+  for (const l of loops) {
+    const P = l.P, n = P.length;
+    const near = (v) => { const d = Math.abs(v.i - mouth); return Math.min(d, N - d) <= 60; };
+    let q0 = -1;
+    for (let q = 0; q < n; q++) if (near(P[q]) && !near(P[(q - 1 + n) % n])) { q0 = q; break; }
+    if (q0 < 0) continue;
+    const Q = P.slice(q0).concat(P.slice(0, q0));
+    let wn = 0;
+    while (wn < n && near(Q[wn])) wn++;
+    // first crossing into the outline, last crossing out of it
+    let E = null, X = null;
+    for (let k = 0; k + 1 < Math.min(wn + 1, n); k++) {
+      const [a0, l0] = loc(Q[k].x, Q[k].z), [a1, l1] = loc(Q[k + 1].x, Q[k + 1].z);
+      for (let ed = 0; ed < 4; ed++) {
+        const [ca, cl] = C[ed], [da, dl] = C[(ed + 1) % 4];
+        const tt = segIntersect(a0, l0, a1, l1, ca, cl, da, dl);
+        if (tt === null) continue;
+        const ia = a0 + (a1 - a0) * tt, il = l0 + (l1 - l0) * tt;
+        const u = clamp(ed % 2 === 0 ? (il - cl) / (dl - cl) : (ia - ca) / (da - ca), 0, 0.999999);
+        const entering = (a1 - a0) * (dl - cl) - (l1 - l0) * (da - ca) > 0;
+        const c = { s: k + tt, k, p: ed + u };
+        if (entering) { if (!E || c.s < E.s) E = c; } else if (!X || c.s > X.s) X = c;
+      }
+    }
+    if (!E || !X || X.s <= E.s) continue;
+    // the way round the outline from E to X that stays off the course
+    const arc = (dir) => {
+      const D = (((dir > 0 ? X.p - E.p : E.p - X.p) % 4) + 4) % 4; // perimeter distance E -> X
+      const ps = [E.p];
+      for (let q = 1; q <= 4; q++) {
+        const c = dir > 0 ? Math.floor(E.p) + q : Math.ceil(E.p) - q;
+        if ((dir > 0 ? c - E.p : E.p - c) >= D) break;
+        ps.push(((c % 4) + 4) % 4);
+      }
+      ps.push(X.p);
+      let inside = 0, total = 0;
+      for (let q = 0; q + 1 < ps.length; q++) {
+        const [a0, l0] = perim(ps[q]), [a1, l1] = perim(ps[q + 1]);
+        const steps = Math.max(1, Math.ceil(Math.hypot(a1 - a0, l1 - l0)));
+        for (let r = 0; r < steps; r++) {
+          const [x, z] = world(lerp(a0, a1, (r + 0.5) / steps), lerp(l0, l1, (r + 0.5) / steps));
+          total++;
+          if (inLoops(course, x, z)) inside++;
+        }
+      }
+      return { ps, off: inside / total };
+    };
+    const A = arc(1), Bk = arc(-1);
+    const best = A.off <= Bk.off ? A : Bk;
+    if (best.off > 0.25) continue;
+    // new loop: ..Q[E.k], E, outline corners, X, Q[X.k + 1]..
+    const verts = best.ps.map((p, q) => {
+      const [al, la] = perim(p);
+      const [x, z] = world(al, la);
+      let k = 0;
+      if (q + 1 < best.ps.length) {
+        const [a1, l1] = perim(best.ps[q + 1]);
+        k = (al + a1) / 2 > e.len - 0.01 ? 2 : 1;
+      } else k = Q[X.k].k;
+      return { x, z, i: q === 0 ? Q[E.k].i : q + 1 === best.ps.length ? Q[(X.k + 1) % n].i : mouth, k, h: k === 1 ? heading : NaN };
+    });
+    const next = Q.slice(0, E.k + 1).concat(verts, Q.slice(X.k + 1));
+    // the detour must not cut through any other barrier
+    let clash = false;
+    const others = loops.map((o) => (o === l ? next : o.P));
+    const v0 = E.k + 1, v1 = E.k + verts.length; // indices of E and X in next
+    for (let q = v0; q < v1 && !clash; q++) {
+      const a = next[q], b = next[q + 1];
+      for (const O of others) {
+        for (let r = 0, m = O.length; r < m && !clash; r++) {
+          if (O === next && r >= v0 - 1 && r <= v1) continue;
+          const c = O[r], d = O[(r + 1) % m];
+          if (segIntersect(a.x, a.z, b.x, b.z, c.x, c.z, d.x, d.z) !== null) clash = true;
+        }
+      }
+    }
+    if (clash) continue;
+    l.P = next;
+    return true;
+  }
+  return false;
+}
+
+// Merge runs of near-collinear vertices into segments of up to maxLen
+// (closed polyline; segment kinds are kept apart).
+function thin(P, tol, maxLen) {
+  const n = P.length;
+  let s0 = 0;
+  for (let q = 0; q < n; q++) if (P[q].k !== P[(q - 1 + n) % n].k) { s0 = q; break; }
+  const Q = P.slice(s0).concat(P.slice(0, s0));
+  const off = (v, a, b) => {
+    const vx = b.x - a.x, vz = b.z - a.z;
+    const u = clamp(((v.x - a.x) * vx + (v.z - a.z) * vz) / (vx * vx + vz * vz || 1), 0, 1);
+    return Math.hypot(v.x - a.x - vx * u, v.z - a.z - vz * u);
+  };
+  const out = [Q[0]];
+  for (let a = 0; a < n;) {
+    let b = a + 1;
+    while (b < n && Q[b].k === Q[a].k) {
+      const c = Q[(b + 1) % n];
+      if (Math.hypot(c.x - Q[a].x, c.z - Q[a].z) > maxLen) break;
+      let ok = true;
+      for (let q = a + 1; q <= b && ok; q++) ok = off(Q[q], Q[a], c) <= tol;
+      if (!ok) break;
+      b++;
+    }
+    if (b < n) out.push(Q[b]);
+    a = b;
+  }
+  return out;
+}
+
+// Split segments longer than maxLen evenly.
+function subdivide(P, maxLen) {
+  const out = [];
+  for (let k = 0, n = P.length; k < n; k++) {
+    const a = P[k], b = P[(k + 1) % n];
+    out.push(a);
+    const m = Math.ceil(Math.hypot(b.x - a.x, b.z - a.z) / maxLen);
+    for (let q = 1; q < m; q++) out.push({ ...a, x: lerp(a.x, b.x, q / m), z: lerp(a.z, b.z, q / m) });
+  }
+  return out;
+}
+
+function packBarriers(t, loops) {
+  let n = 0;
+  for (const l of loops) n += l.P.length;
+  const f = () => new Float32Array(n);
+  const B = {
+    loops: [], n, ax: f(), az: f(), bx: f(), bz: f(), nx: f(), nz: f(), len: f(), y: f(), want: f(),
+    kind: new Uint8Array(n), convex: new Uint8Array(n), vnx: f(), vnz: f(), over: new Uint8Array(n),
+    grid: new Map(), stamp: new Uint32Array(n), qid: 0,
+  };
+  let s = 0;
+  for (const l of loops) {
+    const P = l.P, m = P.length, s0 = s;
+    const pts = new Float32Array(m * 2), src = new Int32Array(m), kind = new Uint8Array(m);
+    for (let k = 0; k < m; k++, s++) {
+      const a = P[k], b = P[(k + 1) % m];
+      pts[k * 2] = a.x; pts[k * 2 + 1] = a.z; src[k] = a.i; kind[k] = a.k;
+      const ux = b.x - a.x, uz = b.z - a.z, L = Math.hypot(ux, uz) || 1e-6;
+      B.ax[s] = a.x; B.az[s] = a.z; B.bx[s] = b.x; B.bz[s] = b.z; B.len[s] = L;
+      // the drivable side is to the right of a left loop, to the left of a right one
+      B.nx[s] = (l.side > 0 ? -uz : uz) / L;
+      B.nz[s] = (l.side > 0 ? ux : -ux) / L;
+      B.y[s] = (t.py[a.i] + t.py[b.i]) / 2;
+      B.kind[s] = a.k;
+      B.want[s] = a.k === 0 ? Math.atan2(ux, uz) : a.h;
+      for (const c of t.crossings) {
+        for (const j of [c.lo, c.hi]) { const d = Math.abs(a.i - j); if (Math.min(d, t.N - d) <= OVER_SPAN) B.over[s] = 1; }
+      }
+    }
+    for (let k = 0; k < m; k++) {
+      const p = s0 + ((k - 1 + m) % m), c = s0 + k;
+      if ((B.bx[c] - B.ax[c]) * B.nx[p] + (B.bz[c] - B.az[c]) * B.nz[p] >= -0.02 * B.len[c]) continue;
+      // a convex corner: it pushes out along the mean of its two faces' normals
+      const vx = B.nx[p] + B.nx[c], vz = B.nz[p] + B.nz[c], l = Math.hypot(vx, vz) || 1;
+      B.convex[c] = 1;
+      B.vnx[c] = vx / l;
+      B.vnz[c] = vz / l;
+    }
+    B.loops.push({ side: l.side, pts, src, kind });
+  }
+  for (let k = 0; k < n; k++) {
+    const x0 = Math.floor(Math.min(B.ax[k], B.bx[k]) / BCELL), x1 = Math.floor(Math.max(B.ax[k], B.bx[k]) / BCELL);
+    const z0 = Math.floor(Math.min(B.az[k], B.bz[k]) / BCELL), z1 = Math.floor(Math.max(B.az[k], B.bz[k]) / BCELL);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        const key = bkey(cx, cz);
+        let b = B.grid.get(key);
+        if (!b) B.grid.set(key, (b = []));
+        b.push(k);
+      }
+    }
+  }
+  return B;
+}
+
+// Indices of barrier segments that may lie within r of (x, z), into out[];
+// returns the count.
+export function barriersNear(B, x, z, r, out) {
+  const id = ++B.qid;
+  let cnt = 0;
+  const x0 = Math.floor((x - r) / BCELL), x1 = Math.floor((x + r) / BCELL);
+  const z0 = Math.floor((z - r) / BCELL), z1 = Math.floor((z + r) / BCELL);
+  for (let cx = x0; cx <= x1; cx++) {
+    for (let cz = z0; cz <= z1; cz++) {
+      const b = B.grid.get(bkey(cx, cz));
+      if (!b) continue;
+      for (let q = 0; q < b.length; q++) {
+        const k = b[q];
+        if (B.stamp[k] !== id) { B.stamp[k] = id; out[cnt++] = k; }
+      }
+    }
+  }
+  return cnt;
+}
+
 // Minimum-curvature-ish racing line via multi-resolution elastic band.
 function computeRacingLine(t) {
-  const { N, px, pz, nx, nz, edgeL, edgeR } = t;
+  const { N, px, pz, nx, nz, roomL, roomR } = t;
   // car edge on the white line (kerbs are a bonus) / clear of the barrier
   const loL = new Float32Array(N), hiL = new Float32Array(N);
-  for (let i = 0; i < N; i++) { hiL[i] = edgeL[i] - 1.0; loL[i] = -(edgeR[i] - 1.0); }
+  for (let i = 0; i < N; i++) { hiL[i] = roomL[i] - 1.0; loL[i] = -(roomR[i] - 1.0); }
   const o = new Float32Array(N);
   const qx = new Float32Array(N), qz = new Float32Array(N);
   const upd = () => { for (let i = 0; i < N; i++) { qx[i] = px[i] + nx[i] * o[i]; qz[i] = pz[i] + nz[i] * o[i]; } };
@@ -468,6 +904,8 @@ export function locate(t, x, z, hint = -1) {
     hw: lerp(t.hw[i0], t.hw[i1], tt),
     edgeL: lerp(t.edgeL[i0], t.edgeL[i1], tt),
     edgeR: lerp(t.edgeR[i0], t.edgeR[i1], tt),
+    roomL: lerp(t.roomL[i0], t.roomL[i1], tt),
+    roomR: lerp(t.roomR[i0], t.roomR[i1], tt),
     kerb: t.kerb[i0],
     surfL: t.surfL[i0], surfR: t.surfR[i0],
   };

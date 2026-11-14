@@ -156,10 +156,11 @@ src/
   cityData.generated.js   street-course data (from tools/gen-cities.mjs)
   tracks.js               track metadata: width, elevation, stands, theme
   trackCore.js            spline, elevation, auto-bridges, walls/run-off,
-                          street corridors + escape roads, racing line
-                          optimiser, speed profiles, locate()
+                          street corridors + escape roads, the barrier lines
+                          (one definition, collided with and drawn), racing
+                          line optimiser, speed profiles, locate()
   physics.js              vehicle dynamics (see below)
-  sim.js                  surfaces, wall + escape-road + car-car collisions
+  sim.js                  surfaces, swept barrier + car-car collisions
   ai.js                   pure-pursuit AI with brake-point planning, overtaking
   cars.js                 car specs + voxel model descriptions
   carModel.js             procedural voxeliser (8 cm voxels, AO) + wheels
@@ -236,9 +237,10 @@ npm test                    # every car laps every track under AI; full-garage r
 node tests/accel.mjs        # 0-100, 0-200, 1/4 mile, top speed, braking
 node tests/skidpad.mjs      # steady-state lateral grip vs theory
 node tests/handling.mjs     # keyboard full-lock flicks: no spins with aids on
+node tests/bounds.mjs       # street courses: barrier lines closed/clear/no saw-tooth; cars stay inside them (crashes at every hard corner + escape road, plus a player-like fuzz round the whole lap) and on the ground drawn under them
 npm run build && node tests/browser.mjs   # headless menus/race/cameras + screenshots
 npm run build && node tests/flow.mjs      # race to results; time trial ghost save
-npm run build && node tests/views.mjs tests/out/nyc nyc   # scenic camera views of a course
+npm run build && node tests/views.mjs tests/out/nyc nyc   # scenic camera views of a course (add `high corners` for the hard corners from above)
 node tests/carshots.mjs [id,id]           # close-up car renders (3/4 front/rear, side, night) -> tests/out/cars
 ```
 
