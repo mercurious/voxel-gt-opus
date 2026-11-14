@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "gen:tracks": "node tools/gen-tracks.mjs",
+    "fetch:city": "node tools/fetch-city.mjs",
+    "gen:cities": "node tools/gen-cities.mjs",
     "dev": "node tools/serve.mjs",
     "build": "node tools/build.mjs",
     "test": "node tests/sim.mjs"

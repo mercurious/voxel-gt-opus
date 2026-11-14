@@ -93,7 +93,7 @@ class CameraRig {
       const i = Math.floor(s / track.ds) % track.N;
       const side = hash1(k, 3) < 0.5 ? 1 : -1;
       const wall = side > 0 ? track.wallL[i] : track.wallR[i];
-      const off = (wall + 4) * side;
+      const off = (wall + (track.def.street ? 1.5 : 4)) * side; // street: on the sidewalk
       const p = track.sample(s, off);
       this.tv.push({ s, x: p.x, y: p.y + 3 + hash1(k, 9) * 7, z: p.z });
     }
@@ -210,8 +210,10 @@ export class Race {
         const paints = pSpec.paints.map((p) => p.hex).concat(EXTRA_PAINTS).filter((h) => h !== this.playerPaint);
         rivals = [0, 1, 2, 3].map((k) => ({ spec: pSpec, paint: paints[k] }));
       } else {
+        // four rivals drawn from the rest of the garage
         rivals = CARS.filter((c) => c.id !== pSpec.id).map((spec) => ({ spec, paint: spec.paints[Math.floor(R() * spec.paints.length)].hex }));
         rivals.sort(() => R() - 0.5);
+        rivals.length = Math.min(rivals.length, spreads.length);
       }
       rivals.forEach((r, k) => {
         r.skill = skillForTarget(track, r.spec, ref * factor * (1 + spreads[k]));
@@ -241,6 +243,9 @@ export class Race {
     });
     if (!this.player) this.player = this.cars[0];
     this.focus = this.player;
+    // night courses: every car runs its lamps; only the focus car gets real
+    // spotlights (costly). Set before the first frame so shaders compile once.
+    if (track.def.theme.night) for (const [rc, obj] of this.objs) obj.setLights(true, { spot: rc === this.player });
 
     // ---- driving line ----------------------------------------------------
     this.playerProfile = speedProfile(track, this.player.spec, 0.95);
@@ -291,7 +296,8 @@ export class Race {
     if ((!rc.started || rc.startCross) && s < L * 0.5) s += L; // just past the line before it registered
     rc.progress = lapsDone * L + s;
     // track limits for time trial: all four wheels off
-    if (rc.isPlayer && Math.abs(rc.loc.d) > this.track.halfW + 1.1 + rc.halfWid) {
+    const loc = rc.loc;
+    if (rc.isPlayer && (loc.d > loc.edgeL + 1.1 + rc.halfWid || -loc.d > loc.edgeR + 1.1 + rc.halfWid)) {
       if (!rc.lapInvalid && rc.started && this.mode === 'timetrial') { rc.lapInvalid = true; this.msg('LAP INVALIDATED', 1.8, 'warn'); }
     }
   }
@@ -559,7 +565,8 @@ export class Race {
     while (rc.fxAcc >= 1) {
       rc.fxAcc -= 1;
       const side = Math.random() < 0.5 ? 1 : -1;
-      const off = v.a - v.L / 2 - M.wheelbase / 2;
+      // smoke from the axle that's sliding (front-drive wheelspin smokes up front)
+      const off = v.a - v.L / 2 + (v.slipF * 0.7 > v.slipR && !offRoad ? 1 : -1) * M.wheelbase / 2;
       const x = v.x + fx * off + lx * side * M.track / 2, z = v.z + fz * off + lz * side * M.track / 2;
       const col = offRoad ? (surf === 'gravel' ? '#cbb994' : '#8a7a55') : '#e8e8e8';
       this.fx.spawn(x, v.y + 0.3, z, -fx * sp * 0.15 + (Math.random() - 0.5), 0.6 + Math.random() * 0.8, -fz * sp * 0.15 + (Math.random() - 0.5), offRoad ? 0.9 : 1.6, offRoad ? 0.5 : 0.8, col);

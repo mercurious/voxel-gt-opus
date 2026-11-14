@@ -4,6 +4,7 @@ import { TRACKS, trackById } from './tracks.js';
 import { CARS, carById } from './cars.js';
 import { buildTrack } from './trackCore.js';
 import { buildTrackScene } from './trackScene.js';
+import { buildCityScene } from './cityScene.js';
 import { buildCarObject } from './carModel.js';
 import { Race } from './game.js';
 import { AIDriver } from './ai.js';
@@ -65,7 +66,7 @@ function loadWorld(id) {
   if (worldTrack) { world.remove(worldTrack.scene.group); worldTrack.scene.dispose(); }
   const core = getTrackCore(id);
   const t0 = performance.now();
-  const scene = buildTrackScene(core, { quality: settings.quality });
+  const scene = (core.def.street ? buildCityScene : buildTrackScene)(core, { quality: settings.quality });
   console.info(`[voxel-gt] built ${id} in ${(performance.now() - t0).toFixed(0)} ms`);
   world.add(scene.group);
   world.fog = scene.fog;

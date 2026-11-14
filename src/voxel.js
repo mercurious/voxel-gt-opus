@@ -157,6 +157,18 @@ export class BoxBuilder {
     this.idx.push(vi, vi + 1, vi + 2, vi, vi + 2, vi + 3);
   }
 
+  // Single triangle (3 world-space points, CCW from the visible side).
+  tri(p0, p1, p2, color, normal) {
+    _c.set(color);
+    const vi = this.pos.length / 3;
+    for (const p of [p0, p1, p2]) {
+      this.pos.push(p[0], p[1], p[2]);
+      this.nor.push(normal[0], normal[1], normal[2]);
+      this.col.push(_c.r, _c.g, _c.b);
+    }
+    this.idx.push(vi, vi + 1, vi + 2);
+  }
+
   build() {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(this.pos, 3));

@@ -140,8 +140,9 @@ export class UI {
     return `
       <div class="title-wrap">
         <div class="logo"><span class="vox">VOXEL</span><span class="gt">GT</span></div>
-        <div class="tagline">Five legends. Three great circuits. Every block hand-placed by physics.</div>
+        <div class="tagline">Eight legends. Three great circuits and real city streets. Every block hand-placed by physics.</div>
         <button class="nav press" data-act="start">Press <kbd>Enter</kbd> or <kbd>A</kbd> to start</button>
+        <div class="credits">Circuit centrelines: bacinger/f1-circuits (MIT) · City streets &amp; buildings: map data © OpenStreetMap contributors (ODbL) · Rendering: three.js</div>
       </div>`;
   }
 
@@ -149,7 +150,7 @@ export class UI {
     const items = [
       ['race', 'Arcade Race', 'Race four rivals over a few laps. Standing start, gantry lights, no mercy.'],
       ['timetrial', 'Time Trial', 'Just you, the clock and a ghost of your best lap.'],
-      ['garage', 'Garage', 'Walk around the five cars and pick your paint.'],
+      ['garage', 'Garage', 'Walk around the eight cars and pick your paint.'],
       ['records', 'Records', 'Your best laps on every circuit.'],
       ['settings', 'Settings', 'Driving aids, transmission, camera, units and graphics.'],
     ];
@@ -188,7 +189,7 @@ export class UI {
     return `
       <div class="track-screen">
         <div class="crumb">${race ? 'Arcade Race' : 'Time Trial'} · ${esc(car.brand)} ${esc(car.name)}</div>
-        <div class="track-cards" data-row="h">
+        <div class="track-cards${TRACKS.length > 3 ? ' compact' : ''}" data-row="h">
           ${TRACKS.map((t) => {
             const best = store.bestLap(t.id, car.id);
             const any = store.bestLapAny(t.id);
@@ -196,7 +197,7 @@ export class UI {
               <canvas width="260" height="170" data-thumb="${t.id}"></canvas>
               <span class="tname">${esc(t.short)}</span>
               <small>${esc(t.location)}</small>
-              <div class="tmeta"><b>${(this.getTrackCore(t.id).length / 1000).toFixed(3)} km</b><b>${t.corners.length} named corners</b><b>${esc(t.theme.time)}</b></div>
+              <div class="tmeta"><b>${(this.getTrackCore(t.id).length / 1000).toFixed(3)} km</b><b>${t.corners.length} named corners</b><b>${esc(t.theme.time)}</b>${t.street ? '<b class="street">Street course</b>' : ''}</div>
               <div class="tbest">Your best (this car): <b>${formatTime(best)}</b>${any ? `<br>Track record: <b>${formatTime(any.time)}</b> · ${esc(carById(any.car).brand)}` : ''}</div>
             </button>`;
           }).join('')}
@@ -306,12 +307,13 @@ export class UI {
           <div class="model">${esc(c.name)} <span>${c.year}</span></div>
           <p>${esc(c.blurb)}</p>
           <dl>
-            <dt>Engine</dt><dd>${esc(c.engine)}${c.turbo ? '' : ''}</dd>
+            <dt>Engine</dt><dd>${esc(c.engine)}</dd>
             <dt>Power</dt><dd>${c.powerPS} PS @ ${c.powerRpm} rpm</dd>
-            <dt>Torque</dt><dd>${c.torqueNm} Nm @ ${c.torqueRpm} rpm</dd>
-            <dt>Drivetrain</dt><dd>${c.layout} · ${c.gears.length}-speed</dd>
+            <dt>Torque</dt><dd>${c.torqueNm} Nm @ ${c.torqueRpm}${c.torqueRpmEnd ? '–' + c.torqueRpmEnd : ''} rpm</dd>
+            <dt>Layout</dt><dd>${c.layout} · ${layoutText(c)}</dd>
+            <dt>Gearbox</dt><dd>${c.gears.length}-speed ${c.trans === 'auto' ? 'automatic' : 'manual'}</dd>
             <dt>Weight</dt><dd>${c.mass} kg · ${st.kgPerPS.toFixed(2)} kg/PS</dd>
-            <dt>Top speed</dt><dd>${s.units === 'mph' ? Math.round(top / 1.609) + ' mph' : top + ' km/h'} (est.)</dd>
+            <dt>Top speed</dt><dd>${s.units === 'mph' ? Math.round(top / 1.609) + ' mph' : top + ' km/h'} ${c.vmax && top >= c.vmax ? '(limited)' : '(est.)'}</dd>
           </dl>
           ${bar('Power', st.barPower)}${bar('Lightness', st.barWeight)}${bar('Grip', st.barGrip)}${bar('Braking', st.barBrake)}`;
         R.querySelector('#paintRow').innerHTML = `<span class="lbl">Paint</span>` + c.paints.map((p, i) => `<button class="nav swatch ${i === this.sel.paint ? 'sel' : ''}" data-paint="${i}" title="${esc(p.name)}"><i style="background:${p.hex}"></i><small>${esc(p.name)}</small></button>`).join('');
@@ -344,7 +346,7 @@ export class UI {
       R.querySelectorAll('[data-thumb]').forEach((c) => drawTrackThumb(c, this.getTrackCore(c.dataset.thumb)));
       const blurb = () => {
         const t = trackById(this.sel.track);
-        R.querySelector('#trackBlurb').innerHTML = `<b>${esc(t.name)}</b> — ${esc(t.blurb)}`;
+        R.querySelector('#trackBlurb').innerHTML = `<b>${esc(t.name)}</b> — ${esc(t.blurb)}${t.street ? ' <small class="attrib">Map data © OpenStreetMap contributors (ODbL).</small>' : ''}`;
       };
       R.querySelectorAll('[data-track]').forEach((b) => {
         const pick = () => {
@@ -381,9 +383,16 @@ function bar(label, v) {
   return `<div class="bar"><span>${label}</span><i><b style="width:${Math.round(Math.max(0.04, v) * 100)}%"></b></i></div>`;
 }
 
+const LAYOUTS = { FF: 'front engine, front drive', FR: 'front engine, rear drive', MR: 'mid engine, rear drive', RR: 'rear engine, rear drive' };
+function layoutText(c) {
+  if (c.layout === '4WD') return c.driveFront >= 0.5 ? 'front-biased all-wheel drive' : 'rear-biased all-wheel drive';
+  return LAYOUTS[c.layout] || '';
+}
+
 function estTop(c) {
   // drag-limited top speed (bisection), capped by gearing at the redline
-  const P = c.powerPS * 735.5 * 0.86;
+  // and by an electronic governor if the car has one
+  const P = c.powerPS * 735.5 * (c.drivelineEff || 0.86);
   let lo = 10, hi = 150;
   for (let k = 0; k < 50; k++) {
     const v = (lo + hi) / 2;
@@ -391,7 +400,9 @@ function estTop(c) {
     if (need < P) lo = v; else hi = v;
   }
   const vg = ((c.redline * Math.PI) / 30) * c.wheelRadius / (c.gears[c.gears.length - 1] * c.final);
-  return Math.round((Math.min(lo, vg) * 3.6) / 5) * 5;
+  const kmh = Math.min(lo, vg) * 3.6;
+  if (c.vmax && kmh >= c.vmax) return c.vmax;
+  return Math.round(kmh / 5) * 5;
 }
 
 function controlsHelp() {

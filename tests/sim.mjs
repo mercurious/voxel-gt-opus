@@ -85,7 +85,7 @@ for (const def of TRACKS) {
   }
   if (!onlyCar) {
     const rr = runRace(track);
-    console.log(`  5-car race: ${rr.t.toFixed(0)}s laps=${rr.lapsDone.join(',')} contacts=${rr.impacts}`);
+    console.log(`  ${CARS.length}-car race: ${rr.t.toFixed(0)}s laps=${rr.lapsDone.join(',')} contacts=${rr.impacts}`);
     if (rr.lapsDone.some((l) => l < 2)) failures++;
   }
 }

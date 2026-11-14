@@ -68,6 +68,7 @@ button { font-family: inherit; color: inherit; }
 
 .title-wrap { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 26px; text-align: center; padding: 24px; }
 .tagline { color: var(--muted); font-size: clamp(15px, 2vw, 20px); letter-spacing: 0.04em; }
+.title-wrap .credits { color: var(--muted); font-size: 11px; opacity: 0.75; max-width: 760px; line-height: 1.5; }
 .press {
   margin-top: 30px; background: none; border: 0; font-size: 18px; letter-spacing: 0.18em; text-transform: uppercase;
   color: var(--text); cursor: pointer; animation: pulse 1.6s ease-in-out infinite; padding: 10px 18px;
@@ -149,8 +150,18 @@ button.big.focus span { color: #fff; }
 .tbest b { color: var(--text); font-variant-numeric: tabular-nums; }
 .track-card.sel { border-color: var(--accent); background: rgba(40, 22, 4, 0.82); }
 .track-card.focus { transform: translateY(-4px); box-shadow: 0 0 0 2px var(--accent); }
+/* compact cards once there are more than three venues: thumbnail beside the text */
+.track-cards.compact { gap: 10px; }
+.track-cards.compact .track-card { display: grid; grid-template-columns: 38% 1fr; grid-auto-rows: min-content; column-gap: 12px; row-gap: 2px; padding: 10px 12px; align-content: start; }
+.track-cards.compact .track-card canvas { grid-row: 1 / span 4; max-height: 15vh; margin: 0; align-self: center; }
+.track-cards.compact .track-card .tname { font-size: 19px; }
+.track-cards.compact .tmeta { margin-top: 2px; gap: 4px; }
+.track-cards.compact .tmeta b { font-size: 11px; padding: 1px 6px; }
+.track-cards.compact .tbest { font-size: 12px; margin-top: 2px; }
+.tmeta b.street { color: var(--accent-2); }
 .track-blurb { color: #c7cfdd; font-size: 15px; line-height: 1.45; background: var(--panel); padding: 12px 16px; }
 .track-blurb b { color: var(--accent-2); font-weight: 600; }
+.track-blurb .attrib { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .track-screen .btn-row { justify-content: flex-end; margin-top: 0; }
 
 /* option rows */
@@ -256,6 +267,7 @@ body.touch #minimap { bottom: 130px; }
   .car-screen .btn-row { grid-row: 5; }
   .track-cards { grid-template-columns: 1fr; }
   .track-card canvas { display: none; }
+  .track-cards.compact .track-card { display: flex; }
   .panel { margin: auto; padding: 20px; }
   .hud-br { transform: scale(0.75); transform-origin: bottom right; }
   #minimap { width: 140px; height: 140px; }

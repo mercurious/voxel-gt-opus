@@ -1,8 +1,8 @@
-// World simulation: cars on a track with surfaces, walls and car-car contact.
+// World simulation: cars on a track with surfaces, barriers and car-car contact.
 // Pure JS (no rendering) so it can be driven headless by tests.
 import { Vehicle, SURFACE } from './physics.js';
 import { clamp, lerp } from './util.js';
-import { SURF_ID } from './trackCore.js';
+import { SURF_ID, barriersNear } from './trackCore.js';
 
 const SURF_BY_ID = [SURFACE.asphalt, SURFACE.grass, SURFACE.gravel, { ...SURFACE.asphalt, mu: 0.96, name: 'runoff' }];
 
@@ -16,6 +16,12 @@ export class RaceCar {
     this.paint = opts.paint || spec.paints[0].hex;
     this.halfLen = spec.model.length / 2;
     this.halfWid = spec.model.width / 2;
+    // the rendered body against the barriers: wheelbase centre +- overhangs,
+    // measured from the CG along the heading (see carModel.js / game.render)
+    this.bodyFront = this.veh.a - this.veh.L / 2 + spec.model.wheelbase / 2 + spec.model.frontOverhang;
+    this.bodyRear = spec.model.length - this.bodyFront;
+    this.safe = { x: 0, z: 0, h: 0, ok: false }; // last pose clear of the barriers
+    this.shoved = false; // pushed by another car this step
     this.hint = -1;
     this.loc = null;
     this.input = { throttle: 0, brake: 0, steer: 0, handbrake: false, shiftUp: false, shiftDown: false };
@@ -44,14 +50,15 @@ export class RaceCar {
     this.veh.reset(p.x, p.z, p.heading, p.y);
     this.hint = p.i;
     this.loc = this.track.locate(p.x, p.z, this.hint);
+    this.safe.ok = false;
     this.lastIdx = this.loc.i;
   }
 }
 
 function surfaceAt(track, loc, d) {
   const ad = Math.abs(d);
-  if (ad <= track.halfW) return SURFACE.asphalt;
-  if (ad <= track.halfW + 1.1 && loc.kerb) return SURFACE.kerb;
+  if (ad <= loc.hw) return SURFACE.asphalt;
+  if (ad <= loc.hw + 1.1 && loc.kerb) return SURFACE.kerb;
   const id = d > 0 ? loc.surfL : loc.surfR;
   if (ad <= track.halfW + 1.6 && id !== SURF_ID.grass) return SURF_BY_ID[id];
   return SURF_BY_ID[id];
@@ -80,45 +87,138 @@ export function stepCar(rc, dt, settings) {
   rc.input.shiftUp = rc.input.shiftDown = false;
 
   loc = track.locate(veh.x, veh.z, loc.i);
-  // ---- walls ----
-  const fx2 = Math.sin(veh.h), fz2 = Math.cos(veh.h);
-  const nx2 = loc.tz, nz2 = -loc.tx;
-  const fn2 = fx2 * nx2 + fz2 * nz2;
-  const ft2 = fx2 * loc.tx + fz2 * loc.tz;
-  const extent = Math.abs(fn2) * rc.halfLen + Math.abs(ft2) * rc.halfWid;
   rc.wallScrape = Math.max(0, rc.wallScrape - dt * 4);
-  for (const side of [1, -1]) {
-    const wall = side > 0 ? loc.wallL : loc.wallR;
-    const pen = side * loc.d + extent - wall;
-    if (pen > 0) {
-      veh.x -= nx2 * side * pen;
-      veh.z -= nz2 * side * pen;
-      let wx = veh.velX, wz = veh.velZ;
-      const vn = (wx * nx2 + wz * nz2) * side; // into the wall
-      if (vn > 0) {
-        const vtX = wx - nx2 * side * vn, vtZ = wz - nz2 * side * vn;
-        const fric = clamp(1 - 0.06 - 0.03 * vn, 0.55, 1);
-        wx = vtX * fric - nx2 * side * vn * 0.3;
-        wz = vtZ * fric - nz2 * side * vn * 0.3;
-        veh.setWorldVel(wx, wz);
-        veh.r *= 0.55;
-        // nudge heading toward the wall direction on glancing hits
-        const want = Math.atan2(loc.tx, loc.tz);
-        let dh = want - veh.h;
-        dh = Math.atan2(Math.sin(dh), Math.cos(dh));
-        if (Math.abs(dh) < 1.2) veh.h += dh * clamp(vn * 0.02, 0, 0.25);
-        rc.impact = Math.max(rc.impact, vn);
-      }
-      rc.wallScrape = 1;
-      loc = track.locate(veh.x, veh.z, loc.i);
-    }
-  }
+  if (collideBarriers(rc)) loc = track.locate(veh.x, veh.z, loc.i);
   veh.y = loc.y;
   rc.loc = loc;
   rc.hint = loc.i;
 }
 
-// Car-car contact using three circles per car.
+// Barrier contact against track.barriers, the same lines the scene draws. The
+// car is its rendered body box. Each corner is swept from the last pose that
+// was clear of the barriers, so it can't tunnel through at any speed or be
+// shoved through by another car; convex barrier corners (kerb corners on the
+// inside of a turn) are kept out of the body's flanks. Contacts resolve
+// deepest first along the barrier normal (sliding along the last face when
+// wedged into an acute corner) with the usual bounce and scrub.
+// Returns true if the car was moved.
+const near = [];
+const cx = new Float64Array(4), cz = new Float64Array(4), sx = new Float64Array(4), sz = new Float64Array(4);
+function bodyCorners(rc, x, z, h, ox, oz) {
+  const fx = Math.sin(h), fz = Math.cos(h), F = rc.bodyFront, R = rc.bodyRear, W = rc.halfWid;
+  ox[0] = x + fx * F + fz * W; oz[0] = z + fz * F - fx * W;
+  ox[1] = x + fx * F - fz * W; oz[1] = z + fz * F + fx * W;
+  ox[2] = x - fx * R - fz * W; oz[2] = z - fz * R + fx * W;
+  ox[3] = x - fx * R + fz * W; oz[3] = z - fz * R - fx * W;
+}
+function collideBarriers(rc) {
+  const B = rc.track.barriers, veh = rc.veh, safe = rc.safe;
+  const W = rc.halfWid, mid = (rc.bodyFront - rc.bodyRear) / 2, hl = (rc.bodyFront + rc.bodyRear) / 2;
+  if (safe.ok) bodyCorners(rc, safe.x, safe.z, safe.h, sx, sz);
+  const travel = safe.ok ? Math.hypot(veh.x - safe.x, veh.z - safe.z) : 0;
+  const cnt = barriersNear(B, veh.x + Math.sin(veh.h) * mid, veh.z + Math.cos(veh.h) * mid, Math.hypot(hl, W) + travel + 1.5, near);
+  let moved = false, clear = false, pnx = 0, pnz = 0; // (pnx, pnz): the last push's normal
+  for (let it = 0; it < 8 && !clear; it++) {
+    bodyCorners(rc, veh.x, veh.z, veh.h, cx, cz);
+    let best = 0, bnx = 0, bnz = 0, bwant = NaN; // deepest contact; (bnx, bnz) = way out
+    for (let c = 0; c < 4; c++) {
+      let cT = 2, cD = 0, cnx = 0, cnz = 0, cw = NaN; // first face crossed this step
+      let sD = 0.75, snx = 0, snz = 0, sw = NaN; // else: shallowest face it is just behind
+      for (let q = 0; q < cnt; q++) {
+        const s = near[q];
+        if (B.over[s] && Math.abs(B.y[s] - veh.y) > 3) continue; // the other level at a bridge
+        const nx = B.nx[s], nz = B.nz[s];
+        const d = (cx[c] - B.ax[s]) * nx + (cz[c] - B.az[s]) * nz;
+        if (d >= 0) continue;
+        const ux = (B.bx[s] - B.ax[s]) / B.len[s], uz = (B.bz[s] - B.az[s]) / B.len[s];
+        const d0 = safe.ok ? (sx[c] - B.ax[s]) * nx + (sz[c] - B.az[s]) * nz : -1;
+        if (d0 >= -0.01) {
+          // was in front of the face line: did it cross within the segment?
+          const t = d0 <= 0 ? 0 : d0 / (d0 - d);
+          const u = (sx[c] + (cx[c] - sx[c]) * t - B.ax[s]) * ux + (sz[c] + (cz[c] - sz[c]) * t - B.az[s]) * uz;
+          if (u >= -0.01 && u <= B.len[s] + 0.01 && t < cT) { cT = t; cD = -d; cnx = nx; cnz = nz; cw = B.want[s]; }
+          continue;
+        }
+        const u = (cx[c] - B.ax[s]) * ux + (cz[c] - B.az[s]) * uz;
+        if (u >= 0 && u <= B.len[s] && -d < sD) { sD = -d; snx = nx; snz = nz; sw = B.want[s]; }
+      }
+      if (cT > 1 && sD < 0.75) { cD = sD; cnx = snx; cnz = snz; cw = sw; }
+      if (cD > best) { best = cD; bnx = cnx; bnz = cnz; bwant = cw; }
+    }
+    // convex barrier corners inside the body: the shortest way out that moves
+    // the car off the corner (along the corner's normal, or straight sideways
+    // or fore/aft when that is shorter and also away from it)
+    const fx = Math.sin(veh.h), fz = Math.cos(veh.h);
+    const bx = veh.x + fx * mid, bz = veh.z + fz * mid;
+    for (let q = 0; q < cnt; q++) {
+      const s = near[q];
+      if (!B.convex[s] || (B.over[s] && Math.abs(B.y[s] - veh.y) > 3)) continue;
+      const rx = B.ax[s] - bx, rz = B.az[s] - bz;
+      const a = rx * fx + rz * fz, b = rx * fz - rz * fx;
+      const da = hl - Math.abs(a), db = W - Math.abs(b);
+      if (da <= 0 || db <= 0) continue;
+      const vx = B.vnx[s], vz = B.vnz[s];
+      const vf = vx * fx + vz * fz, vl = vx * fz - vz * fx; // the normal in body axes
+      let d = Infinity, px = vx, pz = vz;
+      if (vf > 1e-6) d = (hl + a) / vf; else if (vf < -1e-6) d = (hl - a) / -vf;
+      if (vl > 1e-6) d = Math.min(d, (W + b) / vl); else if (vl < -1e-6) d = Math.min(d, (W - b) / -vl);
+      const sl = -Math.sign(b), sf = -Math.sign(a);
+      if (db < d && sl * vl > 0) { d = db; px = sl * fz; pz = -sl * fx; }
+      if (da < d && sf * vf > 0) { d = da; px = sf * fx; pz = sf * fz; }
+      if (d <= best) continue;
+      best = d; bnx = px; bnz = pz; bwant = NaN;
+    }
+    if (best <= 0.001) { clear = true; break; }
+    let mx = bnx, mz = bnz, d = best + 0.002;
+    if (bnx * pnx + bnz * pnz < -0.05) {
+      // wedged between two faces: slide along the last one, not back into it
+      let tx = -pnz, tz = pnx, tn = tx * bnx + tz * bnz;
+      if (tn < 0) { tx = -tx; tz = -tz; tn = -tn; }
+      if (tn > 0.1) { mx = tx; mz = tz; d = Math.min(d / tn, 1); }
+    }
+    veh.x += mx * d;
+    veh.z += mz * d;
+    wallHit(rc, -bnx, -bnz, Number.isNaN(bwant) ? null : bwant);
+    pnx = bnx; pnz = bnz;
+    moved = true;
+  }
+  if (clear || !safe.ok) {
+    safe.x = veh.x; safe.z = veh.z; safe.h = veh.h; safe.ok = true;
+  } else {
+    // jammed (rare): back to the last clear pose, velocity already scrubbed
+    veh.x = safe.x; veh.z = safe.z; veh.h = safe.h;
+    moved = true;
+  }
+  return moved;
+}
+
+// Bounce/scrub the car's velocity off a wall with outward normal (wnx, wnz);
+// glancing hits steer it toward heading `want`.
+function wallHit(rc, wnx, wnz, want) {
+  const veh = rc.veh;
+  let wx = veh.velX, wz = veh.velZ;
+  const vn = wx * wnx + wz * wnz; // into the wall
+  if (vn > 0) {
+    const vtX = wx - wnx * vn, vtZ = wz - wnz * vn;
+    const fric = clamp(1 - 0.06 - 0.03 * vn, 0.55, 1);
+    wx = vtX * fric - wnx * vn * 0.3;
+    wz = vtZ * fric - wnz * vn * 0.3;
+    veh.setWorldVel(wx, wz);
+    veh.r *= 0.55;
+    // nudge heading toward the wall direction on glancing hits
+    if (want !== null) {
+      let dh = want - veh.h;
+      dh = Math.atan2(Math.sin(dh), Math.cos(dh));
+      if (Math.abs(dh) < 1.2) veh.h += dh * clamp(vn * 0.02, 0, 0.25);
+    }
+    rc.impact = Math.max(rc.impact, vn);
+  }
+  rc.wallScrape = 1;
+}
+
+// Car-car contact using three circles per car. A car shoved into a barrier is
+// put back out of it straight away (sim invariant: after a step no car is
+// inside a barrier).
 export function collideCars(cars) {
   for (let i = 0; i < cars.length; i++) {
     const A = cars[i];
@@ -151,6 +251,8 @@ export function collideCars(cars) {
       const corr = pen / (ima + imb);
       va.x -= nx * corr * ima; va.z -= nz * corr * ima;
       vb.x += nx * corr * imb; vb.z += nz * corr * imb;
+      if (ima) A.shoved = true;
+      if (imb) B.shoved = true;
       // velocities at contact (rotation contributes r * (oz, -ox))
       const vax = va.velX + va.r * oaz, vaz = va.velZ - va.r * oax;
       const vbx = vb.velX + vb.r * obz, vbz = vb.velZ - vb.r * obx;
@@ -174,4 +276,5 @@ export function collideCars(cars) {
       B.impact = Math.max(B.impact, strength);
     }
   }
+  for (const c of cars) if (c.shoved) { c.shoved = false; collideBarriers(c); }
 }
