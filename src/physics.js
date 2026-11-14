@@ -10,7 +10,7 @@ import { clamp, lerp, sign } from './util.js';
 export const G = 9.81;
 export const TIRE_MU = 1.1; // sports road tyres
 const RHO = 1.225;
-const DRIVER_EFF = 0.86; // drivetrain efficiency
+const DRIVER_EFF = 0.86; // drivetrain efficiency (spec.drivelineEff overrides: AWD + automatic lose more)
 // Front tyres are a touch softer/less grippy than the rears: mild, stable
 // understeer at the limit like a real road car. spec.rearGrip tunes balance.
 const PAC_C = 1.5, PAC_BF = 14, PAC_BR = 17;
@@ -37,10 +37,12 @@ export class Vehicle {
     const psToW = 735.5;
     const wPk = (spec.powerRpm * Math.PI) / 30;
     const tAtP = (spec.powerPS * psToW) / wPk;
+    // optional flat-torque plateau (turbo engines) from torqueRpm to torqueRpmEnd
     this.curve = [
       [0, spec.torqueNm * 0.45],
       [spec.idle, spec.torqueNm * 0.55],
       [spec.torqueRpm, spec.torqueNm],
+      ...(spec.torqueRpmEnd ? [[spec.torqueRpmEnd, spec.torqueNm]] : []),
       [spec.powerRpm, tAtP],
       [spec.redline + 400, tAtP * 0.84],
     ];
@@ -69,6 +71,8 @@ export class Vehicle {
     this.pitch = 0; this.roll = 0; this.pitchV = 0; this.rollV = 0;
     this.offroad = 0;
     this.lastShift = 0;
+    this.latUseF = 0; // front lateral force / capacity, last step (TCS)
+    this.split = this.spec.driveFront; // current front share of drive
   }
 
   get speed() {
@@ -179,9 +183,15 @@ export class Vehicle {
     const capF = muF * Fzf, capR = muR * Fzr;
 
     // ---- engine ---------------------------------------------------------
-    const engaged = this.gear !== 0 && this.shiftTimer <= 0;
+    // electronic speed governor (e.g. the Mazda3 Turbo's 134 mph limiter)
+    if (s.vmax && this.gear >= 1) throttle = Math.min(throttle, clamp((s.vmax / 3.6 - this.vx) * 4, 0, 1));
+    // A torque-converter automatic keeps driving through its shifts (with a
+    // torque dip) and multiplies torque below its stall speed.
+    const tc = s.torqueConverter;
+    const shifting = this.shiftTimer > 0;
+    const engaged = this.gear !== 0 && (!shifting || !!tc);
     const rpmW = this.wheelRpm();
-    const launchRpm = Math.min(s.torqueRpm, s.redline * 0.55);
+    const launchRpm = tc ? tc.stall : Math.min(s.torqueRpm, s.redline * 0.55);
     let targetRpm;
     if (engaged) targetRpm = Math.max(rpmW, s.idle + throttle * (launchRpm - s.idle) * (rpmW < launchRpm ? 1 : 0));
     else targetRpm = s.idle + throttle * (s.redline - s.idle);
@@ -195,7 +205,12 @@ export class Vehicle {
     this.revLimiter = this.rpm >= s.redline;
     let engT = 0;
     if (engaged) {
-      const tq = this.torqueAt(this.rpm) * (s.turbo ? 0.62 + 0.38 * this.boost : 1);
+      let tq = this.torqueAt(this.rpm) * (s.turbo ? 0.62 + 0.38 * this.boost : 1);
+      if (tc) {
+        const sr = clamp(rpmW / Math.max(this.rpm, 1), 0, 1); // converter speed ratio
+        tq *= 1 + (tc.mult - 1) * clamp((0.85 - sr) / 0.85, 0, 1);
+        if (shifting) tq *= 0.55;
+      }
       engT = this.revLimiter ? 0 : tq * throttle;
       engT -= (1 - throttle) * s.torqueNm * 0.14 * (this.rpm / s.redline); // engine braking
     }
@@ -203,10 +218,15 @@ export class Vehicle {
 
     // ---- longitudinal forces per axle ----------------------------------
     const ratio = this.ratio();
-    let Fdrive = engaged ? (engT * ratio * DRIVER_EFF) / this.R : 0;
+    let Fdrive = engaged ? (engT * ratio * (s.drivelineEff || DRIVER_EFF)) / this.R : 0;
     // ASM: cut throttle when the rear is stepping out
     if (env.asm && this.asmActive > 0.2 && Fdrive > 0) Fdrive *= 1 - clamp(this.asmActive, 0, 0.7);
-    let FdF = Fdrive * s.driveFront, FdR = Fdrive * (1 - s.driveFront);
+    let split = s.driveFront;
+    // Active on-demand AWD (front-biased): send drive rearward as the front
+    // tyres approach their traction limit, down to awdMinFront at the front.
+    if (s.awdMinFront != null && Fdrive > 0) split = clamp((capF * 0.7) / Fdrive, s.awdMinFront, s.driveFront);
+    this.split = split;
+    let FdF = Fdrive * split, FdR = Fdrive * (1 - split);
 
     const brakeTotal = brake * s.brake * 1.35 * m * G;
     // EBD: split braking by the axles' current load so neither end saturates first
@@ -229,8 +249,13 @@ export class Vehicle {
     let spinF = false, spinR = false;
     this.tcsActive = Math.max(0, this.tcsActive - dt * 4);
     const tcsLimit = 0.78;
-    if (Math.abs(FxF) > capF * (env.tcs ? tcsLimit : 0.98)) {
-      if (env.tcs && FdF !== 0 && Math.sign(FdF) === Math.sign(FxF)) { FxF = sign(FxF) * capF * tcsLimit; this.tcsActive = 1; }
+    // Front-axle TCS (driven fronts) runs closer to peak slip in a straight
+    // line but leaves room for cornering force: the harder the fronts work
+    // laterally, the less drive it lets through (FF/AWD corner exits).
+    const drivingF = FdF > 0 && FxF > 0;
+    const tcsF = drivingF ? (tcsLimit + 0.12) * (1 - 0.4 * this.latUseF * this.latUseF) : tcsLimit;
+    if (Math.abs(FxF) > capF * (env.tcs ? tcsF : 0.98)) {
+      if (env.tcs && FdF !== 0 && Math.sign(FdF) === Math.sign(FxF)) { FxF = sign(FxF) * capF * tcsF; this.tcsActive = 1; }
       else { FxF = sign(FxF) * capF * 0.9; spinF = true; }
     }
     if (Math.abs(FxR) > capR * (env.tcs ? tcsLimit : 0.98)) {
@@ -242,9 +267,16 @@ export class Vehicle {
     // ---- steering --------------------------------------------------------
     const maxSt = this.maxSteer(env.surfF.mu, input.steer || 0);
     const targetSteer = clamp(input.steer || 0, -1, 1) * maxSt;
-    const rate = 3.2; // rad/s rack speed
+    const rate = s.steerRate || 3.2; // rad/s rack speed
     this.steerAngle += clamp(targetSteer - this.steerAngle, -rate * dt, rate * dt);
-    const d = this.steerAngle;
+    let d = this.steerAngle;
+    // Torque steer (driven front axle): under hard drive the wheels pull to
+    // one side and unwind toward straight -> power understeer, strongest in
+    // low gears.
+    if (s.torqueSteer && drivingF) {
+      const u = clamp(FxF / capF, 0, 1) * clamp(1.4 - this.vx / 35, 0.3, 1);
+      d = d * (1 - s.torqueSteer.unwind * u) - s.torqueSteer.pull * u;
+    }
 
     // ---- slip angles & lateral forces -----------------------------------
     const vxa = Math.max(Math.abs(this.vx), 3.0);
@@ -259,6 +291,7 @@ export class Vehicle {
     const ellR = Math.sqrt(Math.max(0.0, 1 - (FxR / capR) ** 2));
     let FyF = -capF * pacF(aF) * ellF * (spinF ? 0.8 : 1);
     let FyR = -capR * pacR(aR) * ellR * (spinR ? (handbrakeR ? 0.55 : 0.8) : 1);
+    this.latUseF = Math.min(1, Math.abs(FyF) / capF);
 
     // force on car body
     const FxFc = FxF * cd - FyF * sd;
@@ -338,7 +371,8 @@ export class Vehicle {
     this.slipR = clamp((Math.abs(aR) - pkA) / 0.25, 0, 1) + (spinR ? 0.8 : 0);
     this.spinning = spinR || spinF;
     this.locked = handbrakeR;
-    const wF = this.vx / this.R, wR = spinR && !handbrakeR ? (this.vx + 6 * sign(FxR)) / this.R : handbrakeR ? 0 : this.vx / this.R;
+    const wF = spinF && FdF > 0 ? (this.vx + 6) / this.R : this.vx / this.R;
+    const wR = spinR && !handbrakeR ? (this.vx + 6 * sign(FxR)) / this.R : handbrakeR ? 0 : this.vx / this.R;
     this.wheelSpin[0] = (this.wheelSpin[0] + wF * dt) % (Math.PI * 2);
     this.wheelSpin[1] = (this.wheelSpin[1] + wR * dt) % (Math.PI * 2);
 

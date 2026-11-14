@@ -1,7 +1,24 @@
 // Circuit definitions. Layouts come from real centerlines (see
 // trackData.generated.js); elevation keys are [lap fraction, meters] and are
 // hand-tuned approximations of each venue's profile.
+//
+// City street courses come from OpenStreetMap (cityData.generated.js, built by
+// tools/gen-cities.mjs): centreline, per-point width and real elevation, the
+// street corridor that bounds the barriers, escape roads and named corners.
+// Their scenery is built by cityScene.js plus a per-city module in src/city/.
 import { TRACK_POINTS } from './trackData.generated.js';
+import { CITY_DATA } from './cityData.generated.js';
+
+function cityCourse(id, meta) {
+  const d = CITY_DATA[id];
+  return {
+    id, city: id, street: true,
+    points: d.points, pointW: d.pointW, pointY: d.pointY,
+    corridor: d.corridor, escapes: d.escapes, corners: d.corners,
+    width: 14, verge: 0, runoff: 0,
+    ...meta,
+  };
+}
 
 export const TRACKS = [
   {
@@ -115,6 +132,74 @@ export const TRACKS = [
       asphalt: ['#4c4f54', '#515459', '#484b50'],
     },
   },
+  cityCourse('nyc', {
+    name: 'New York City — Midtown Manhattan',
+    short: 'New York',
+    location: 'Manhattan, USA',
+    blurb: 'Down Fifth Avenue past St Patrick’s to the Library, through the neon canyon of Times Square, round Columbus Circle and back along Central Park South.',
+    stands: [],
+    // team tents + transporters on the plaza east of 5th Ave between 58th and 59th
+    paddock: { from: -150, to: -50, side: 'L', offset: 6 },
+    landmarks: [],
+    theme: {
+      time: 'Golden hour',
+      skyTop: '#5a83bf', skyHorizon: '#f4c992', fog: '#e9c9a0', fogNear: 220, fogFar: 1900,
+      // low sun straight down the cross streets (a nod to "Manhattanhenge")
+      sunDir: [-0.8, 0.36, -0.45], sunColor: '#ffd49a', sunIntensity: 2.5,
+      hemiSky: '#cdd9ee', hemiGround: '#7a6550', hemiIntensity: 1.25,
+      clouds: 12, cloudColor: '#ffe3c4',
+      asphalt: ['#4a4c51', '#4f5156', '#46484d'],
+      sidewalk: ['#aeaca6', '#b6b3ad', '#a7a5a0'],
+      ground: ['#86878a', '#8c8d90', '#818285'], // pavement / plazas between the streets
+      grass: ['#5b8f3a', '#64983f', '#557f35'],
+      night: false,
+    },
+  }),
+  cityCourse('tokyo', {
+    name: 'Tokyo — Aoyama & Akasaka (Route 246)',
+    short: 'Tokyo',
+    location: 'Minato & Shinjuku, Japan',
+    blurb: 'Night on Route 246: down Aoyama-dori to Akasaka-mitsuke, under the Shuto expressway and up the moat past Benkei-bashi to Yotsuya, then back along the Akasaka Palace grounds through Shinanomachi.',
+    stands: [],
+    landmarks: [],
+    theme: {
+      time: 'Night',
+      skyTop: '#03071a', skyHorizon: '#1c2850', fog: '#151d3a', fogNear: 140, fogFar: 1500,
+      // the "sun" is the moon at night: a pale disc and a weak cool key light
+      sunDir: [0.35, 0.5, 0.65], sunColor: '#9fb3e6', sunIntensity: 0.55, moon: true,
+      hemiSky: '#45568a', hemiGround: '#2e2620', hemiIntensity: 0.75,
+      clouds: 0,
+      asphalt: ['#2f3136', '#33353a', '#2c2e33'],
+      sidewalk: ['#6a6b6f', '#717276', '#646569'],
+      ground: ['#4a4b4f', '#4f5054', '#46474b'],
+      grass: ['#2d4a28', '#33522c', '#294424'],
+      night: true,
+    },
+  }),
+  cityCourse('madrid', {
+    name: 'Madrid — Gran Vía & Madrid de los Austrias',
+    short: 'Madrid',
+    location: 'Madrid, Spain',
+    blurb: 'Down the Gran Vía from Plaza de España to the Metrópolis dome, round Cibeles and Neptuno, past the Congreso lions into the Puerta del Sol, along narrow Calle Mayor and back up Bailén beneath the Royal Palace.',
+    stands: [],
+    // team tents + transporters in the Plaza de España gardens, beside the run to the start
+    paddock: { from: -470, to: -390, side: 'L', offset: 7 },
+    landmarks: [],
+    theme: {
+      time: 'Late afternoon',
+      skyTop: '#4d7ec6', skyHorizon: '#f7c88c', fog: '#eec79c', fogNear: 230, fogFar: 1900,
+      // low sun in the west-south-west: Gran Vía's facades glow, the Prado sits in shade
+      sunDir: [-0.8, 0.4, 0.3], sunColor: '#ffcc8a', sunIntensity: 2.6,
+      hemiSky: '#cfdaee', hemiGround: '#8a6a4c', hemiIntensity: 1.2,
+      clouds: 10, cloudColor: '#ffe0bd',
+      asphalt: ['#4d4c4f', '#525154', '#49484b'],
+      sidewalk: ['#c2b7a4', '#cabfac', '#bab09d'],
+      ground: ['#b0a690', '#b7ad97', '#a99f8a'], // granite paving between the streets
+      grass: ['#62903c', '#6b9a42', '#5a8536'],
+      treeLod: 45, // OSM maps nearly every street tree: merged crowns beyond 45 m
+      night: false,
+    },
+  }),
 ];
 
 export function trackById(id) {

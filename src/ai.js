@@ -37,20 +37,19 @@ export class AIDriver {
       }
     }
     if (blocker) {
-      const room = tr.halfW - 1.4;
+      const roomL = loc.edgeL - 1.4, roomR = loc.edgeR - 1.4;
       const od = blocker.loc.d;
       // go to whichever side has more space
-      const leftSpace = room - od, rightSpace = od + room;
+      const leftSpace = roomL - od, rightSpace = od + roomR;
       const want = leftSpace > rightSpace ? od + 2.6 : od - 2.6;
-      this.passTarget = clamp(want - tr.lineOff[loc.i], -room * 2, room * 2);
+      this.passTarget = clamp(want - tr.lineOff[loc.i], -roomR * 2, roomL * 2);
     } else this.passTarget *= Math.pow(0.4, dt);
     this.passOff = lerp(this.passOff, this.passTarget, 1 - Math.exp(-dt * 2.2));
 
     // ---- steering: pure pursuit -------------------------------------------
     const look = clamp(7 + v * 0.42, 9, 42);
     const iT = (loc.i + Math.round(look / ds)) % N;
-    const lim = tr.halfW - 1.1;
-    const off = clamp(tr.lineOff[iT] + this.passOff, -lim, lim);
+    const off = clamp(tr.lineOff[iT] + this.passOff, -(tr.edgeR[iT] - 1.1), tr.edgeL[iT] - 1.1);
     const txp = tr.px[iT] + tr.nx[iT] * off, tzp = tr.pz[iT] + tr.nz[iT] * off;
     const dx = txp - veh.x, dz = tzp - veh.z;
     const fx = Math.sin(veh.h), fz = Math.cos(veh.h);
@@ -78,7 +77,7 @@ export class AIDriver {
     }
     if (this.passOff !== 0 && Math.abs(this.passOff) > 1.5) vt *= 0.985;
     if (blocker && bestGap < 10 && Math.abs(blocker.loc.d - loc.d) < 2.2) vt = Math.min(vt, blocker.veh.vx - 0.5);
-    const offTrack = Math.abs(loc.d) > tr.halfW + 0.5;
+    const offTrack = loc.d > loc.edgeL + 0.5 || -loc.d > loc.edgeR + 0.5;
     if (offTrack) vt = Math.min(vt, 22);
     vt *= this.pace;
     const err = vt - v;

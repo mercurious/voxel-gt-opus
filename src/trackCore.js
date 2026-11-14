@@ -1,5 +1,12 @@
 // Track geometry that both the simulation and renderer use. No three.js here,
 // so it runs headless in tests.
+//
+// Circuits (Monza, Suzuka, Spa) have a constant width, elevation keys and
+// generous run-off. Street courses (def.street) add per-point data from the
+// city generator: road width + real elevation per raw point (def.pointW,
+// def.pointY), the course's street corridor (def.corridor) that bounds the
+// barriers, and escape roads (def.escapes) where the barrier opens into a
+// side street.
 import { clamp, lerp, smoothstep, wrapAngle, periodicCurve } from './util.js';
 import { G, TIRE_MU, FRONT_MU } from './physics.js';
 
@@ -19,6 +26,8 @@ function catmullUniformClosed(xs, zs, sub) {
   return [ox, oz];
 }
 
+// Arc-length resample. src[k] = fractional index into the input polyline, so
+// per-point attributes of the input can follow the resampled curve.
 function resampleClosed(xs, zs, step) {
   const n = xs.length;
   const cum = new Float64Array(n + 1);
@@ -26,7 +35,7 @@ function resampleClosed(xs, zs, step) {
   const L = cum[n];
   const N = Math.round(L / step);
   const ds = L / N;
-  const px = new Float32Array(N), pz = new Float32Array(N);
+  const px = new Float32Array(N), pz = new Float32Array(N), src = new Float32Array(N);
   let j = 0;
   for (let k = 0; k < N; k++) {
     const s = k * ds;
@@ -34,8 +43,16 @@ function resampleClosed(xs, zs, step) {
     const t = (s - cum[j]) / (cum[j + 1] - cum[j] || 1);
     px[k] = lerp(xs[j], xs[(j + 1) % n], t);
     pz[k] = lerp(zs[j], zs[(j + 1) % n], t);
+    src[k] = j + t;
   }
-  return { px, pz, N, ds, L };
+  return { px, pz, N, ds, L, src };
+}
+
+// Linear interpolation of a closed per-point array at a fractional index.
+function perPoint(arr, f) {
+  const n = arr.length;
+  const i0 = Math.floor(f) % n, u = f - Math.floor(f);
+  return lerp(arr[i0], arr[(i0 + 1) % n], u);
 }
 
 // circular moving average
@@ -90,7 +107,8 @@ export function buildTrack(def) {
   const rx = [], rz = [];
   for (let i = 0; i < raw.length; i += 2) { rx.push(raw[i]); rz.push(raw[i + 1]); }
   const [dx, dz] = catmullUniformClosed(rx, rz, 8);
-  const { px, pz, N, ds, L } = resampleClosed(dx, dz, def.step || 2);
+  const { px, pz, N, ds, L, src } = resampleClosed(dx, dz, def.step || 2);
+  const SUB = 8; // catmull subdivisions per raw point
 
   // tangents / normals / heading
   const tx = new Float32Array(N), tz = new Float32Array(N), nx = new Float32Array(N), nz = new Float32Array(N);
@@ -113,10 +131,22 @@ export function buildTrack(def) {
   const curv = smoothArr(curvRaw, 3, 2);
 
   // ---- elevation ----------------------------------------------------------
-  const elev = periodicCurve(def.elevation || [[0, 0], [0.5, 0]]);
   let py = new Float32Array(N);
-  for (let i = 0; i < N; i++) py[i] = elev(i / N);
+  if (def.pointY) {
+    for (let i = 0; i < N; i++) py[i] = perPoint(def.pointY, src[i] / SUB);
+  } else {
+    const elev = periodicCurve(def.elevation || [[0, 0], [0.5, 0]]);
+    for (let i = 0; i < N; i++) py[i] = elev(i / N);
+  }
   py = smoothArr(py, 10, 2);
+
+  // road half-width per sample (constant on circuits)
+  const halfW = def.width / 2;
+  let hw = new Float32Array(N).fill(halfW);
+  if (def.pointW) {
+    for (let i = 0; i < N; i++) hw[i] = perPoint(def.pointW, src[i] / SUB) / 2;
+    hw = smoothArr(hw, Math.round(6 / ds), 2);
+  }
 
   // self-crossings (Suzuka): later pass goes over the earlier one
   const crossings = [];
@@ -150,35 +180,36 @@ export function buildTrack(def) {
   for (let i = 0; i < N; i++) slope[i] = (py[(i + 1) % N] - py[(i - 1 + N) % N]) / (2 * ds);
 
   // ---- widths, kerbs, run-off, walls --------------------------------------
-  const halfW = def.width / 2;
   const absK = new Float32Array(N);
   for (let i = 0; i < N; i++) absK[i] = Math.abs(curv[i]);
-  const cornerF = new Float32Array(N); // 0 straight .. 1 tight corner
-  for (let i = 0; i < N; i++) cornerF[i] = smoothstep(0.003, 0.02, absK[i]);
-  const kerb = new Uint8Array(N); // bit0 left, bit1 right
+  const kerb2 = new Uint8Array(N); // bit0 left, bit1 right
   const runL = new Float32Array(N), runR = new Float32Array(N);
-  const surfL = new Uint8Array(N), surfR = new Uint8Array(N);
-  const reach = Math.round(36 / ds), back = Math.round(14 / ds);
-  for (let i = 0; i < N; i++) {
-    // outside-of-corner run-off extends past the exit, where cars run wide
-    let outL = 0, outR = 0, inL = 0, inR = 0;
-    for (let k = -back; k <= reach; k++) {
-      const j = (i - k + N) % N; // corner at j upstream (k>0) of i
-      const f = cornerF[j] * (k > 0 ? 1 - k / (reach + 1) : 1);
-      if (curv[j] > 0) { outR = Math.max(outR, f); inL = Math.max(inL, f); }
-      else { outL = Math.max(outL, f); inR = Math.max(inR, f); }
+  const surfL = new Uint8Array(N), surfR = new Uint8Array(N); // street: all asphalt
+  if (!def.street) {
+    const cornerF = new Float32Array(N); // 0 straight .. 1 tight corner
+    for (let i = 0; i < N; i++) cornerF[i] = smoothstep(0.003, 0.02, absK[i]);
+    const kerb = new Uint8Array(N);
+    const reach = Math.round(36 / ds), back = Math.round(14 / ds);
+    for (let i = 0; i < N; i++) {
+      // outside-of-corner run-off extends past the exit, where cars run wide
+      let outL = 0, outR = 0, inL = 0, inR = 0;
+      for (let k = -back; k <= reach; k++) {
+        const j = (i - k + N) % N; // corner at j upstream (k>0) of i
+        const f = cornerF[j] * (k > 0 ? 1 - k / (reach + 1) : 1);
+        if (curv[j] > 0) { outR = Math.max(outR, f); inL = Math.max(inL, f); }
+        else { outL = Math.max(outL, f); inR = Math.max(inR, f); }
+      }
+      runL[i] = def.verge + def.runoff * outL + 3 * inL;
+      runR[i] = def.verge + def.runoff * outR + 3 * inR;
+      const kf = absK[i] > 0.006;
+      surfL[i] = outL > 0.3 ? SURF_ID[def.runoffSurface || 'gravel'] : SURF_ID.grass;
+      surfR[i] = outR > 0.3 ? SURF_ID[def.runoffSurface || 'gravel'] : SURF_ID.grass;
+      if (kf) kerb[i] = 3;
     }
-    runL[i] = def.verge + def.runoff * outL + 3 * inL;
-    runR[i] = def.verge + def.runoff * outR + 3 * inR;
-    const kf = absK[i] > 0.006;
-    surfL[i] = outL > 0.3 ? SURF_ID[def.runoffSurface || 'gravel'] : SURF_ID.grass;
-    surfR[i] = outR > 0.3 ? SURF_ID[def.runoffSurface || 'gravel'] : SURF_ID.grass;
-    if (kf) kerb[i] = 3;
+    // grow kerbs a little along the track
+    const kgrow = Math.round(8 / ds);
+    for (let i = 0; i < N; i++) if (kerb[i]) for (let k = -kgrow; k <= kgrow; k++) kerb2[(i + k + N) % N] = 3;
   }
-  // grow kerbs a little along the track
-  const kerb2 = new Uint8Array(N);
-  const kgrow = Math.round(8 / ds);
-  for (let i = 0; i < N; i++) if (kerb[i]) for (let k = -kgrow; k <= kgrow; k++) kerb2[(i + k + N) % N] = 3;
 
   // keep walls clear of other parts of the circuit (ignore over/under passes)
   const ptGrid = new Grid(30);
@@ -194,29 +225,53 @@ export function buildTrack(def) {
       const ddx = px[j] - px[i], ddz = pz[j] - pz[i];
       const dist = Math.hypot(ddx, ddz);
       const side = ddx * nx[i] + ddz * nz[i];
-      const lim = Math.max(halfW + 2.5, dist * 0.5 - 0.5);
+      const lim = Math.max(hw[i] + 2.5, dist * 0.5 - 0.5);
       if (side > 0) limL[i] = Math.min(limL[i], lim);
       else limR[i] = Math.min(limR[i], lim);
     });
   }
-  let wallL = new Float32Array(N), wallR = new Float32Array(N);
-  for (let i = 0; i < N; i++) {
-    wallL[i] = halfW + runL[i];
-    wallR[i] = halfW + runR[i];
+  let wallL, wallR;
+  if (def.street) {
+    [wallL, wallR] = streetWalls(def, { N, ds, px, pz, nx, nz, hw, limL, limR });
+  } else {
+    wallL = new Float32Array(N); wallR = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      wallL[i] = halfW + runL[i];
+      wallR[i] = halfW + runR[i];
+    }
+    wallL = smoothArr(wallL, Math.round(20 / ds), 2);
+    wallR = smoothArr(wallR, Math.round(20 / ds), 2);
+    for (let i = 0; i < N; i++) { wallL[i] = Math.min(wallL[i], limL[i]); wallR[i] = Math.min(wallR[i], limR[i]); }
+    // the min() can leave steps; ease them while never exceeding the limit
+    const wl2 = smoothArr(wallL, 3, 2), wr2 = smoothArr(wallR, 3, 2);
+    for (let i = 0; i < N; i++) {
+      wallL[i] = Math.max(halfW + 2.5, Math.min(wl2[i], limL[i]));
+      wallR[i] = Math.max(halfW + 2.5, Math.min(wr2[i], limR[i]));
+    }
   }
-  wallL = smoothArr(wallL, Math.round(20 / ds), 2);
-  wallR = smoothArr(wallR, Math.round(20 / ds), 2);
-  for (let i = 0; i < N; i++) { wallL[i] = Math.min(wallL[i], limL[i]); wallR[i] = Math.min(wallR[i], limR[i]); }
-  // the min() can leave steps; ease them while never exceeding the limit
-  const wl2 = smoothArr(wallL, 3, 2), wr2 = smoothArr(wallR, 3, 2);
+  // usable track either side of the centreline (racing line + AI limits):
+  // the painted edge on circuits, the barrier (less a margin) on streets.
+  // Tight street corners keep extra room on the inside: pure pursuit cuts
+  // the apex of a 90-degree turn by a metre or so.
+  const edgeL = new Float32Array(N), edgeR = new Float32Array(N);
+  let inL = new Float32Array(N), inR = new Float32Array(N);
+  if (def.street) {
+    for (let i = 0; i < N; i++) {
+      const f = 1.3 * smoothstep(0.02, 0.07, absK[i]);
+      if (curv[i] > 0) inL[i] = f; else inR[i] = f;
+    }
+    inL = smoothArr(inL, Math.round(6 / ds), 2);
+    inR = smoothArr(inR, Math.round(6 / ds), 2);
+  }
   for (let i = 0; i < N; i++) {
-    wallL[i] = Math.max(halfW + 2.5, Math.min(wl2[i], limL[i]));
-    wallR[i] = Math.max(halfW + 2.5, Math.min(wr2[i], limR[i]));
+    edgeL[i] = def.street ? wallL[i] - 0.7 - inL[i] : hw[i];
+    edgeR[i] = def.street ? wallR[i] - 0.7 - inR[i] : hw[i];
   }
 
   const track = {
     def, N, ds, length: L, px, pz, py, tx, tz, nx, nz, head, curv, slope,
-    halfW, wallL, wallR, kerb: kerb2, surfL, surfR, crossings,
+    halfW, hw, edgeL, edgeR, wallL, wallR, kerb: kerb2, surfL, surfR, crossings,
+    escapes: buildEscapes(def),
     lineOff: null, lineCurv: null,
   };
   computeRacingLine(track);
@@ -225,10 +280,74 @@ export function buildTrack(def) {
   return track;
 }
 
+// Street barriers: march out along each normal while still inside the union
+// of the course's street rectangles (def.corridor = flat [x0,z0,x1,z1,halfW]),
+// so straights get a barrier on the kerb line and 90-degree corners open up
+// to the whole intersection box. The barrier face sits 0.5 m inside the kerb.
+function streetWalls(def, t) {
+  const { N, ds, px, pz, nx, nz, hw, limL, limR } = t;
+  const segs = [];
+  const grid = new Grid(40);
+  const c = def.corridor;
+  for (let k = 0; k < c.length; k += 5) {
+    const x0 = c[k], z0 = c[k + 1], x1 = c[k + 2], z1 = c[k + 3], h = c[k + 4];
+    const L = Math.hypot(x1 - x0, z1 - z0) || 1e-3;
+    const si = segs.length;
+    segs.push({ x0, z0, ux: (x1 - x0) / L, uz: (z1 - z0) / L, L, h });
+    for (let s = 0; s <= L + 20; s += 20) grid.add(x0 + segs[si].ux * Math.min(s, L), z0 + segs[si].uz * Math.min(s, L), si);
+  }
+  const inside = (x, z) => {
+    let hit = false;
+    grid.query(x, z, 45, (si) => {
+      if (hit) return;
+      const s = segs[si];
+      const dx = x - s.x0, dz = z - s.z0;
+      const a = dx * s.ux + dz * s.uz, lat = dz * s.ux - dx * s.uz;
+      if (a >= -s.h && a <= s.L + s.h && Math.abs(lat) <= s.h) hit = true;
+    });
+    return hit;
+  };
+  const cap = def.wallCap || 20, gap = 0.5;
+  const out = [new Float32Array(N), new Float32Array(N)];
+  for (let i = 0; i < N; i++) {
+    for (const [k, side] of [[0, 1], [1, -1]]) {
+      let d = hw[i];
+      while (d < cap && inside(px[i] + nx[i] * side * (d + 0.25), pz[i] + nz[i] * side * (d + 0.25))) d += 0.25;
+      out[k][i] = d - gap;
+    }
+  }
+  // round off the intersection-box corners, never inside the kerb line
+  const lim = [limL, limR];
+  return out.map((w, k) => {
+    const s = smoothArr(w, Math.round(3 / ds), 2);
+    for (let i = 0; i < N; i++) s[i] = Math.min(lim[k][i], Math.max(hw[i] - gap, Math.min(s[i], w[i] + 1)));
+    return s;
+  });
+}
+
+// Escape roads: oriented rectangles (side-street stubs) the car may enter
+// where a barrier opens. def.escapes = [{x, z, dx, dz, hw, len}]: mouth centre,
+// unit direction, half-width and length.
+function buildEscapes(def) {
+  return (def.escapes || []).map((e) => ({ ...e, nx: -e.dz, nz: e.dx }));
+}
+
+// Escape road containing (x, z), with local coordinates, or null.
+export function escapeAt(track, x, z, margin = 0) {
+  for (const e of track.escapes) {
+    const rx = x - e.x, rz = z - e.z;
+    const along = rx * e.dx + rz * e.dz, lat = rx * e.nx + rz * e.nz;
+    if (along >= -margin && along <= e.len + margin && Math.abs(lat) <= e.hw + margin) return { e, along, lat };
+  }
+  return null;
+}
+
 // Minimum-curvature-ish racing line via multi-resolution elastic band.
 function computeRacingLine(t) {
-  const { N, px, pz, nx, nz, halfW } = t;
-  const lim = halfW - 1.0; // car edge on the white line; kerbs are a bonus
+  const { N, px, pz, nx, nz, edgeL, edgeR } = t;
+  // car edge on the white line (kerbs are a bonus) / clear of the barrier
+  const loL = new Float32Array(N), hiL = new Float32Array(N);
+  for (let i = 0; i < N; i++) { hiL[i] = edgeL[i] - 1.0; loL[i] = -(edgeR[i] - 1.0); }
   const o = new Float32Array(N);
   const qx = new Float32Array(N), qz = new Float32Array(N);
   const upd = () => { for (let i = 0; i < N; i++) { qx[i] = px[i] + nx[i] * o[i]; qz[i] = pz[i] + nz[i] * o[i]; } };
@@ -239,7 +358,7 @@ function computeRacingLine(t) {
         const a = (i - k + N) % N, b = (i + k) % N;
         const mx = (qx[a] + qx[b]) * 0.5, mz = (qz[a] + qz[b]) * 0.5;
         const delta = (mx - qx[i]) * nx[i] + (mz - qz[i]) * nz[i];
-        o[i] = clamp(o[i] + delta * 0.6, -lim, lim);
+        o[i] = clamp(o[i] + delta * 0.6, loL[i], hiL[i]);
       }
     }
   }
@@ -249,7 +368,7 @@ function computeRacingLine(t) {
     for (let i = 0; i < N; i++) {
       const a = (i - 2 + N) % N, b = (i + 2) % N;
       const mx = (qx[a] + qx[b]) * 0.5, mz = (qz[a] + qz[b]) * 0.5;
-      o[i] = clamp(o[i] + ((mx - qx[i]) * nx[i] + (mz - qz[i]) * nz[i]) * 0.5, -lim - 0.4, lim + 0.4);
+      o[i] = clamp(o[i] + ((mx - qx[i]) * nx[i] + (mz - qz[i]) * nz[i]) * 0.5, loL[i] - 0.4, hiL[i] + 0.4);
     }
   }
   upd();
@@ -346,6 +465,9 @@ export function locate(t, x, z, hint = -1) {
     tx: lerp(t.tx[i0], t.tx[i1], tt), tz: lerp(t.tz[i0], t.tz[i1], tt),
     wallL: lerp(t.wallL[i0], t.wallL[i1], tt),
     wallR: lerp(t.wallR[i0], t.wallR[i1], tt),
+    hw: lerp(t.hw[i0], t.hw[i1], tt),
+    edgeL: lerp(t.edgeL[i0], t.edgeL[i1], tt),
+    edgeR: lerp(t.edgeR[i0], t.edgeR[i1], tt),
     kerb: t.kerb[i0],
     surfL: t.surfL[i0], surfR: t.surfR[i0],
   };

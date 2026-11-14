@@ -1,5 +1,6 @@
 // Web Audio synthesis: engine (rpm-tracking oscillators through a waveshaper
-// and filter), turbo whistle + blow-off, tyre squeal, wind, impacts, beeps.
+// and filter), turbo whistle + blow-off, supercharger whine, tyre squeal,
+// wind, impacts, beeps.
 import { clamp } from './util.js';
 
 function noiseBuffer(ctx, seconds = 2) {
@@ -50,6 +51,18 @@ class EngineVoice {
       this.whistle.start();
       this.lastBoost = 0;
     }
+    // supercharger: a roots blower whines in step with the crank (no lag)
+    if (spec.supercharger) {
+      this.blower = ctx.createOscillator();
+      this.blower.type = 'triangle';
+      this.blowerFilter = ctx.createBiquadFilter();
+      this.blowerFilter.type = 'bandpass';
+      this.blowerFilter.Q.value = 4;
+      this.bGain = ctx.createGain();
+      this.bGain.gain.value = 0;
+      this.blower.connect(this.blowerFilter).connect(this.bGain).connect(audio.engineBus);
+      this.blower.start();
+    }
   }
   update(veh, throttle, distGain = 1) {
     const ctx = this.audio.ctx, t = ctx.currentTime;
@@ -69,6 +82,13 @@ class EngineVoice {
       if (this.lastBoost - veh.boost > 0.25 && this.gainScale > 0.5) this.audio.blowOff(this.lastBoost);
       this.lastBoost = veh.boost * 0.9 + this.lastBoost * 0.1;
     }
+    if (this.blower) {
+      // rotor pulses: crank rpm x pulley ratio x 6 lobe passes per rotor rev
+      const fb = (rpm / 60) * (s.supercharger.ratio || 2) * 6;
+      this.blower.frequency.setTargetAtTime(fb, t, 0.02);
+      this.blowerFilter.frequency.setTargetAtTime(fb, t, 0.02);
+      this.bGain.gain.setTargetAtTime((0.01 + 0.05 * load) * r * r * this.gainScale * distGain, t, 0.04);
+    }
   }
   stop() {
     const t = this.audio.ctx.currentTime;
@@ -76,6 +96,7 @@ class EngineVoice {
     setTimeout(() => {
       for (const { o } of this.oscs) o.stop();
       if (this.whistle) this.whistle.stop();
+      if (this.blower) { this.blower.stop(); this.bGain.disconnect(); }
       this.out.disconnect();
       if (this.wGain) this.wGain.disconnect();
     }, 300);

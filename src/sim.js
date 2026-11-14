@@ -2,7 +2,7 @@
 // Pure JS (no rendering) so it can be driven headless by tests.
 import { Vehicle, SURFACE } from './physics.js';
 import { clamp, lerp } from './util.js';
-import { SURF_ID } from './trackCore.js';
+import { SURF_ID, escapeAt } from './trackCore.js';
 
 const SURF_BY_ID = [SURFACE.asphalt, SURFACE.grass, SURFACE.gravel, { ...SURFACE.asphalt, mu: 0.96, name: 'runoff' }];
 
@@ -50,8 +50,8 @@ export class RaceCar {
 
 function surfaceAt(track, loc, d) {
   const ad = Math.abs(d);
-  if (ad <= track.halfW) return SURFACE.asphalt;
-  if (ad <= track.halfW + 1.1 && loc.kerb) return SURFACE.kerb;
+  if (ad <= loc.hw) return SURFACE.asphalt;
+  if (ad <= loc.hw + 1.1 && loc.kerb) return SURFACE.kerb;
   const id = d > 0 ? loc.surfL : loc.surfR;
   if (ad <= track.halfW + 1.6 && id !== SURF_ID.grass) return SURF_BY_ID[id];
   return SURF_BY_ID[id];
@@ -87,35 +87,59 @@ export function stepCar(rc, dt, settings) {
   const ft2 = fx2 * loc.tx + fz2 * loc.tz;
   const extent = Math.abs(fn2) * rc.halfLen + Math.abs(ft2) * rc.halfWid;
   rc.wallScrape = Math.max(0, rc.wallScrape - dt * 4);
-  for (const side of [1, -1]) {
-    const wall = side > 0 ? loc.wallL : loc.wallR;
-    const pen = side * loc.d + extent - wall;
-    if (pen > 0) {
-      veh.x -= nx2 * side * pen;
-      veh.z -= nz2 * side * pen;
-      let wx = veh.velX, wz = veh.velZ;
-      const vn = (wx * nx2 + wz * nz2) * side; // into the wall
-      if (vn > 0) {
-        const vtX = wx - nx2 * side * vn, vtZ = wz - nz2 * side * vn;
-        const fric = clamp(1 - 0.06 - 0.03 * vn, 0.55, 1);
-        wx = vtX * fric - nx2 * side * vn * 0.3;
-        wz = vtZ * fric - nz2 * side * vn * 0.3;
-        veh.setWorldVel(wx, wz);
-        veh.r *= 0.55;
-        // nudge heading toward the wall direction on glancing hits
-        const want = Math.atan2(loc.tx, loc.tz);
-        let dh = want - veh.h;
-        dh = Math.atan2(Math.sin(dh), Math.cos(dh));
-        if (Math.abs(dh) < 1.2) veh.h += dh * clamp(vn * 0.02, 0, 0.25);
-        rc.impact = Math.max(rc.impact, vn);
+  // inside an escape road (and outside the main barrier line) its own side and
+  // end walls apply instead of the track's
+  const esc = track.escapes.length ? escapeAt(track, veh.x, veh.z, 2) : null;
+  if (esc && Math.max(loc.d + extent - loc.wallL, -loc.d + extent - loc.wallR) > 0) {
+    const e = esc.e;
+    const fd = Math.abs(fx2 * e.dx + fz2 * e.dz), fl = Math.abs(fx2 * e.nx + fz2 * e.nz);
+    const extLat = fl * rc.halfLen + fd * rc.halfWid, extLong = fd * rc.halfLen + fl * rc.halfWid;
+    for (const side of [1, -1]) {
+      const pen = side * esc.lat + extLat - e.hw;
+      if (pen > 0) wallHit(rc, e.nx * side, e.nz * side, pen, Math.atan2(e.dx, e.dz));
+    }
+    const pen = esc.along + extLong - e.len;
+    if (pen > 0) wallHit(rc, e.dx, e.dz, pen, null);
+    loc = track.locate(veh.x, veh.z, loc.i);
+  } else {
+    for (const side of [1, -1]) {
+      const wall = side > 0 ? loc.wallL : loc.wallR;
+      const pen = side * loc.d + extent - wall;
+      if (pen > 0) {
+        wallHit(rc, nx2 * side, nz2 * side, pen, Math.atan2(loc.tx, loc.tz));
+        loc = track.locate(veh.x, veh.z, loc.i);
       }
-      rc.wallScrape = 1;
-      loc = track.locate(veh.x, veh.z, loc.i);
     }
   }
   veh.y = loc.y;
   rc.loc = loc;
   rc.hint = loc.i;
+}
+
+// Push the car `pen` metres back from a wall with outward normal (wnx, wnz)
+// and bounce/scrub its velocity; glancing hits steer it toward heading `want`.
+function wallHit(rc, wnx, wnz, pen, want) {
+  const veh = rc.veh;
+  veh.x -= wnx * pen;
+  veh.z -= wnz * pen;
+  let wx = veh.velX, wz = veh.velZ;
+  const vn = wx * wnx + wz * wnz; // into the wall
+  if (vn > 0) {
+    const vtX = wx - wnx * vn, vtZ = wz - wnz * vn;
+    const fric = clamp(1 - 0.06 - 0.03 * vn, 0.55, 1);
+    wx = vtX * fric - wnx * vn * 0.3;
+    wz = vtZ * fric - wnz * vn * 0.3;
+    veh.setWorldVel(wx, wz);
+    veh.r *= 0.55;
+    // nudge heading toward the wall direction on glancing hits
+    if (want !== null) {
+      let dh = want - veh.h;
+      dh = Math.atan2(Math.sin(dh), Math.cos(dh));
+      if (Math.abs(dh) < 1.2) veh.h += dh * clamp(vn * 0.02, 0, 0.25);
+    }
+    rc.impact = Math.max(rc.impact, vn);
+  }
+  rc.wallScrape = 1;
 }
 
 // Car-car contact using three circles per car.
